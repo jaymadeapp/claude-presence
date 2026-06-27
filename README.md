@@ -10,12 +10,41 @@ application per user, so every session is merged into one card (the count goes t
 ## Prerequisites
 
 - **macOS** (the only supported platform today).
-- A **Rust toolchain** (stable) to build the binary: <https://rustup.rs>.
+- A **Rust toolchain** (stable) — only if you build from source; Homebrew installs
+  a prebuilt binary and needs no toolchain: <https://rustup.rs>.
 - The **Discord desktop app** running and logged in (the daemon connects over
   Discord's local IPC socket; there is no bot token, OAuth, or network egress).
 - **Claude Code** installed (this is what the daemon observes).
 
-## Build
+## Install with Homebrew (recommended)
+
+```sh
+brew install jaymadeapp/tap/claude-presence
+claude-presence install
+```
+
+The first command installs the prebuilt `claude-presence` binary from the
+[tap](https://github.com/jaymadeapp/homebrew-tap) (no Rust toolchain needed); the
+second wires up the launchd agent, the statusLine wrapper, and the hooks (see
+[Install / Uninstall](#install--uninstall)). `claude-presence install` prompts you
+about hiding your project and the running command — see [Privacy](#privacy).
+
+Turn the presence off and on without uninstalling:
+
+```sh
+claude-presence disable   # alias: off — clears the Discord card; survives reboot
+claude-presence enable    # alias: on
+```
+
+To remove everything, **unwire first, then uninstall the binary** — Homebrew only
+removes the binary; it cannot boot out launchd or unchain your hooks:
+
+```sh
+claude-presence uninstall
+brew uninstall claude-presence
+```
+
+## Build from source (alternative)
 
 ```sh
 cargo build --release
@@ -99,8 +128,10 @@ Every install action has a tested, exact uninstall (NFR-6).
 | Command | What it does |
 |---|---|
 | `claude-presence run` | Run the daemon in the **foreground** (the same code launchd runs; useful for debugging). |
-| `claude-presence install` | Install the launchd agent + chained statusline wrapper + chained hooks (reversible), then start the daemon. |
+| `claude-presence install` | Install the launchd agent + chained statusline wrapper + chained hooks (reversible), then start the daemon. Prompts whether to hide your project / running command; scriptable with `--hide-project`/`--show-project`, `--hide-command`/`--show-command`, `--private`, `-y`. |
 | `claude-presence uninstall` | Fully revert everything `install` set up. |
+| `claude-presence enable` (`on`) | Re-load the launchd agent after a `disable`. |
+| `claude-presence disable` (`off`) | Unload the launchd agent and clear the Discord card without uninstalling (survives reboot). |
 | `claude-presence status` | Show detected live sessions (pid, project, branch), whether a Discord IPC socket is present, and whether a daemon is already running. |
 | `claude-presence doctor` | Diagnose the install with PASS/WARN/FAIL lines + hints: Discord socket, statusLine wiring, hooks wiring (e.g. `6/6`), launchd plist, config validity (effective `client_id`/capacity), single-instance conflicts, detected sessions, and the buttons-on-own-profile caveat. |
 
@@ -138,16 +169,26 @@ State (the daemon socket, logs, the installed scripts) lives under
 
 ## Privacy
 
-Privacy is on by default (C-7). Transcripts contain your prompts, file paths, and
-possibly secrets — none of that ever leaves the process or reaches the daemon's own
-logs. Only structured, sanitized fields are emitted, to Discord **and** to logs:
+Baseline sanitization is always on (C-7). Transcripts contain your prompts, file
+paths, and possibly secrets — none of that ever leaves the process or reaches the
+daemon's own logs. Only structured, sanitized fields are emitted, to Discord **and**
+to logs:
 
-- **Private mode** (`privacy.redact`, default **on**): only generic/sanitized
-  labels are emitted — no targets, no AI title.
+- **Hide the project / the running command** (`[privacy.fields]`, both shown by
+  default). `claude-presence install` asks whether to hide each (default: hide), or
+  set them directly: `privacy.fields.project = false` collapses the project (and
+  branch) to a generic label; `privacy.fields.command = false` hides the running
+  command in the small-icon tooltip (only the bare verb "Running" shows). The Bash
+  command target is **always** sanitized to a bare program name regardless — an
+  env-assignment, `$(…)` substitution, path, or secret can never appear on the card.
+- **Private mode** (`privacy.redact`, default **off**): when on, only
+  generic/sanitized labels are emitted — no project, branch, activity target, AI
+  title, model, or metrics. The blunt "hide everything" switch (`install --private`).
 - **Bash arguments are dropped by default.** With `privacy.scrub_bash_args = true`
   a command may be shown, but only after secrets (tokens, keys, passwords,
   `Authorization`, `WORD=value` env-assignments, credentialed URLs, long base64/hex
-  blobs) are stripped and the result truncated.
+  blobs) are stripped and the result truncated. (`privacy.fields.command = false`
+  takes precedence and hides the command regardless.)
 - **AI-generated session title is off by default** (`show_ai_title`); it is only
   ever shown when explicitly enabled **and** the project is not blacklisted.
 - **Paths are reduced to a basename** — never a full path or your home directory.

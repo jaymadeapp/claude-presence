@@ -317,20 +317,23 @@ fn format_details(
 
     let private = is_private(session, cfg);
 
+    // The project is hidden when private mode is on OR the per-field project
+    // toggle is off (`fields.project = false` collapses it to the generic label).
+    let hide_project = cfg.privacy.redact || !cfg.privacy.fields.project;
+
     // Project label is resolved through the privacy helper so a blacklisted /
-    // redacted project collapses to the generic label (never the basename).
-    let project = crate::privacy::project_label(
-        &session.cwd,
-        cfg.privacy.redact,
-        &cfg.privacy.blacklist_paths,
-    );
+    // redacted / project-hidden session collapses to the generic label (never the
+    // basename).
+    let project =
+        crate::privacy::project_label(&session.cwd, hide_project, &cfg.privacy.blacklist_paths);
 
     // Single-session headline: the project the session is working on. Any live
     // agent count is surfaced in `state` (the "N× model" prefix), not here.
     let mut details = format!("Working on {project}");
 
-    // Branch is suppressed entirely in private mode (it is identifying).
-    if cfg.fields.branch && !private {
+    // Branch is suppressed in private mode AND when the project is hidden (the
+    // branch reveals the repo, so it must follow `fields.project`).
+    if cfg.fields.branch && !private && cfg.privacy.fields.project {
         if let Some(branch) = session
             .branch
             .as_deref()
@@ -1004,6 +1007,27 @@ mod tests {
     }
 
     #[test]
+    fn project_hidden_collapses_details_and_branch_but_keeps_metrics() {
+        // fields.project = false collapses the project to the generic label and
+        // suppresses the branch (it reveals the repo); model + metrics + state are
+        // unaffected.
+        let mut cfg = Config::default();
+        cfg.privacy.fields.project = false;
+        let mut aggregator = Aggregator::new(cfg);
+        let PresenceUpdate::Activity(model) = aggregator.aggregate(vec![session("a", 10)]) else {
+            panic!("expected activity");
+        };
+        assert_eq!(
+            model.details,
+            format!("Working on {}", crate::privacy::GENERIC_PROJECT)
+        );
+        assert!(!model.details.contains("private"), "{}", model.details);
+        assert!(!model.details.contains("main"), "{}", model.details);
+        // State still carries the model (and metrics are untouched by this toggle).
+        assert!(model.state.contains("Opus 4.8"), "{}", model.state);
+    }
+
+    #[test]
     fn single_session_with_agents_keeps_project_in_details_and_count_in_state() {
         // A single session running subagents keeps the project in `details`; the
         // agent count is the "N×" model prefix in `state`.
@@ -1053,6 +1077,7 @@ mod tests {
                 redact: false,
                 blacklist_paths: vec![std::path::PathBuf::from("/Users/me/Projects/private")],
                 scrub_bash_args: false,
+                fields: Default::default(),
             },
             ..Config::default()
         };

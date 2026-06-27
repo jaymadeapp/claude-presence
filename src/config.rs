@@ -171,6 +171,34 @@ pub struct PrivacySettings {
     pub blacklist_paths: Vec<PathBuf>,
     /// When set, Bash commands are shown (scrubbed of secrets) instead of dropped.
     pub scrub_bash_args: bool,
+    /// Finer per-field privacy toggles (the `[privacy.fields]` table).
+    pub fields: PrivacyFields,
+}
+
+/// Finer per-field privacy toggles (`[privacy.fields]`).
+///
+/// These default to `true` (INFORMATIVE posture): the code default still shows
+/// the project and the running command. It is the *installer* — not this code
+/// default — that steers a privacy-conscious user toward hiding these (it writes
+/// `false` into the config when asked). Set a field to `false` to hide it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PrivacyFields {
+    /// When `false`, collapses the project to a generic label (and suppresses the
+    /// git branch, which would otherwise reveal the repo).
+    pub project: bool,
+    /// When `false`, hides the running command (Bash) target in the small-icon
+    /// tooltip — only the bare verb ("Running") is shown.
+    pub command: bool,
+}
+
+impl Default for PrivacyFields {
+    fn default() -> Self {
+        Self {
+            project: true,
+            command: true,
+        }
+    }
 }
 
 /// Built-in tool → verb map used when the user supplies none.
@@ -238,6 +266,52 @@ impl Config {
     /// Parse a [`Config`] from a TOML string.
     pub fn from_toml(contents: &str) -> Result<Self, toml::de::Error> {
         toml::from_str(contents)
+    }
+
+    /// Serialize and write the config to [`Config::path`] atomically and durably.
+    ///
+    /// Creates the parent dir (`0700`) if absent, serializes to TOML, then writes
+    /// to a sibling temp file, `fsync`s it, and `rename`s it over the target with
+    /// mode `0600` — mirroring the atomic-write style in `install/statusline.rs`.
+    /// Used by `claude-presence install` to persist the user's privacy choices
+    /// before the daemon starts (there is no hot reload). Returns an `io::Error`
+    /// (TOML serialization failures are mapped to one) so it never panics.
+    pub fn save(&self) -> Result<(), std::io::Error> {
+        use std::io::Write;
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+        let path = Self::path().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "could not resolve the config directory",
+            )
+        })?;
+
+        let parent = path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("config path has no parent directory"))?;
+        if !parent.exists() {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)?;
+        }
+
+        let contents = toml::to_string(self).map_err(std::io::Error::other)?;
+
+        let tmp = path.with_extension("toml.tmp");
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            f.write_all(contents.as_bytes())?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
     }
 }
 
@@ -325,5 +399,46 @@ mod tests {
     fn unknown_field_is_rejected() {
         // deny_unknown_fields guards against silent typos in user configs.
         assert!(Config::from_toml("nope = 1").is_err());
+    }
+
+    #[test]
+    fn privacy_fields_default_to_informative() {
+        // The code default is INFORMATIVE (true/true); the installer, not the code
+        // default, steers a user toward hiding.
+        let fields = PrivacyFields::default();
+        assert!(fields.project);
+        assert!(fields.command);
+        // PrivacySettings::default() (derived) must wire PrivacyFields::default().
+        let privacy = PrivacySettings::default();
+        assert!(!privacy.redact);
+        assert!(privacy.blacklist_paths.is_empty());
+        assert!(!privacy.scrub_bash_args);
+        assert!(privacy.fields.project);
+        assert!(privacy.fields.command);
+    }
+
+    #[test]
+    fn privacy_fields_partial_toml_keeps_other_field_true() {
+        // `command = false` must not drag `project` along — serde default fills it.
+        let toml = "[privacy.fields]\ncommand = false\n";
+        let cfg = Config::from_toml(toml).unwrap();
+        assert!(
+            cfg.privacy.fields.project,
+            "project stays at its true default"
+        );
+        assert!(!cfg.privacy.fields.command);
+    }
+
+    #[test]
+    fn old_toml_without_fields_table_still_loads() {
+        // An old config that predates [privacy.fields] must load with the table
+        // filled by serde defaults (true/true).
+        let toml = r#"
+            [privacy]
+            redact = false
+        "#;
+        let cfg = Config::from_toml(toml).unwrap();
+        assert!(cfg.privacy.fields.project);
+        assert!(cfg.privacy.fields.command);
     }
 }

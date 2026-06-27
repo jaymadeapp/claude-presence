@@ -271,6 +271,7 @@ fn privacy_wiring_blacklist_and_redact_collapse_the_card() {
             redact: false,
             blacklist_paths: vec![std::path::PathBuf::from("/Users/me/Projects/private")],
             scrub_bash_args: false,
+            fields: Default::default(),
         },
         ..Config::default()
     };
@@ -312,6 +313,7 @@ fn privacy_wiring_blacklist_and_redact_collapse_the_card() {
             redact: false,
             blacklist_paths: vec![std::path::PathBuf::from("/Users/me/Projects/private")],
             scrub_bash_args: false,
+            fields: Default::default(),
         },
         ..Config::default()
     });

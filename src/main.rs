@@ -26,9 +26,34 @@ enum Command {
     /// Run the daemon in the foreground.
     Run,
     /// Install the launchd agent + chained hooks + statusline wrapper (reversible).
-    Install,
+    Install {
+        /// Hide which project you're working in (privacy.fields.project=false)
+        #[arg(long)]
+        hide_project: bool,
+        /// Show the project name (overrides the interactive default)
+        #[arg(long, conflicts_with = "hide_project")]
+        show_project: bool,
+        /// Hide the running command in the small-icon tooltip (privacy.fields.command=false)
+        #[arg(long)]
+        hide_command: bool,
+        /// Show the running command (overrides the interactive default)
+        #[arg(long, conflicts_with = "hide_command")]
+        show_command: bool,
+        /// Global private mode: hide everything (privacy.redact=true)
+        #[arg(long)]
+        private: bool,
+        /// Don't prompt; use flag values / privacy-preserving defaults (for brew/CI)
+        #[arg(long, short = 'y', visible_alias = "non-interactive")]
+        yes: bool,
+    },
     /// Fully revert everything `install` set up.
     Uninstall,
+    /// Re-enable the daemon (load the launchd agent).
+    #[command(visible_alias = "on")]
+    Enable,
+    /// Disable the daemon and clear the Discord presence (unload the launchd agent).
+    #[command(visible_alias = "off")]
+    Disable,
     /// Show detected sessions and the Discord connection state.
     Status,
     /// Diagnose Discord socket, sessions, settings wiring, and instance conflicts.
@@ -56,12 +81,38 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Run => claude_presence::run().await,
-        Command::Install => install(),
+        Command::Install {
+            hide_project,
+            show_project,
+            hide_command,
+            show_command,
+            private,
+            yes,
+        } => install(InstallOpts {
+            hide_project,
+            show_project,
+            hide_command,
+            show_command,
+            private,
+            yes,
+        }),
         Command::Uninstall => uninstall(),
+        Command::Enable => enable(),
+        Command::Disable => disable(),
         Command::Status => status(),
         Command::Doctor => doctor(),
         Command::Forward { kind } => forward(kind),
     }
+}
+
+/// Resolved install-time privacy choices from the CLI flags.
+struct InstallOpts {
+    hide_project: bool,
+    show_project: bool,
+    hide_command: bool,
+    show_command: bool,
+    private: bool,
+    yes: bool,
 }
 
 /// Compose the three reversible installers into one `install` (FR-8/AC-2).
@@ -74,8 +125,13 @@ async fn main() -> Result<()> {
 /// On any step failing, the steps already applied are rolled back best-effort
 /// (in reverse order) so a partial install never leaves the user half-wired
 /// (NFR-6); anything that cannot be reverted is logged, not swallowed silently.
-fn install() -> Result<()> {
+fn install(opts: InstallOpts) -> Result<()> {
     println!("Installing claude-presence…");
+
+    // Resolve and persist the user's privacy choices BEFORE bootstrapping launchd:
+    // the config has no hot reload, so the daemon must find these on first start.
+    // This writes user data; it is intentionally NOT rolled back on a later failure.
+    resolve_and_save_privacy(&opts)?;
 
     statusline::install()?;
     println!("  [ok] statusline wrapper chained");
@@ -96,6 +152,103 @@ fn install() -> Result<()> {
     println!("  [ok] launchd agent bootstrapped (daemon started)");
 
     println!("Install complete. Run `claude-presence doctor` to verify.");
+    Ok(())
+}
+
+/// Resolve the install-time privacy choices (flags → interactive prompt →
+/// privacy-preserving defaults) and persist them into the config file.
+///
+/// Precedence per axis: an explicit `--show-*`/`--hide-*` flag wins; otherwise,
+/// when interactive (stdin is a TTY and `--yes` was not passed) we prompt with a
+/// default of HIDE; otherwise (non-interactive, no flag) we default to HIDE.
+/// `--private` additionally enables global redaction. The config is loaded,
+/// updated, and written via [`Config::save`] (user data — never rolled back).
+fn resolve_and_save_privacy(opts: &InstallOpts) -> Result<()> {
+    use std::io::IsTerminal;
+
+    let interactive = std::io::stdin().is_terminal() && !opts.yes;
+    let mut cfg = Config::load();
+
+    if opts.private {
+        cfg.privacy.redact = true;
+    }
+
+    // Project axis: explicit flag → prompt (default hide) → default hide.
+    cfg.privacy.fields.project = if opts.show_project {
+        true
+    } else if opts.hide_project {
+        false
+    } else if interactive {
+        !prompt_yes_no("Hide which project you're working in?")
+    } else {
+        false
+    };
+
+    // Command axis: same resolution.
+    cfg.privacy.fields.command = if opts.show_command {
+        true
+    } else if opts.hide_command {
+        false
+    } else if interactive {
+        !prompt_yes_no("Hide the command currently running?")
+    } else {
+        false
+    };
+
+    if interactive {
+        println!(
+            "  Model, metrics and the elapsed timer are always shown. Use --private to hide everything."
+        );
+    }
+
+    cfg.save()?;
+    Ok(())
+}
+
+/// Ask a yes/no question on stdout, reading one line from stdin. The default is
+/// YES (shown as `[Y/n]`): an empty line or a `y`/`Y` answer is treated as yes,
+/// anything else as no. A read error falls back to the default (yes).
+fn prompt_yes_no(question: &str) -> bool {
+    use std::io::Write;
+
+    print!("{question} [Y/n] ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    match std::io::stdin().read_line(&mut line) {
+        Ok(_) => {
+            let answer = line.trim();
+            answer.is_empty() || answer.eq_ignore_ascii_case("y")
+        }
+        Err(_) => true,
+    }
+}
+
+/// Re-enable the daemon by loading the launchd agent (the `on` alias, FR-8).
+///
+/// Requires a prior `install` (the plist must exist); a missing plist is a clear
+/// error pointing the user at `claude-presence install` rather than a silent no-op.
+fn enable() -> Result<()> {
+    let path = launchd::plist_path()?;
+    if !path.exists() {
+        eprintln!("claude-presence: not installed — run `claude-presence install` first.");
+        return Err(Error::Other(
+            "launchd agent plist missing; run `claude-presence install`".into(),
+        ));
+    }
+    launchd::bootstrap(&path)?;
+    println!("claude-presence: enabled (presence will appear when a session is active).");
+    Ok(())
+}
+
+/// Disable the daemon by unloading the launchd agent (the `off` alias, FR-8).
+///
+/// `bootout` sends SIGTERM; the daemon's graceful shutdown already clears the
+/// Discord presence (see `src/lib.rs` shutdown path → sink `clear_activity`), so
+/// no extra IPC is needed here. `bootout` is idempotent / tolerant of a
+/// not-loaded job, like uninstall.
+fn disable() -> Result<()> {
+    launchd::bootout(launchd::label())?;
+    println!("claude-presence: disabled — Discord presence cleared.");
     Ok(())
 }
 

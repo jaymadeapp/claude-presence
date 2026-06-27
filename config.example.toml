@@ -111,8 +111,8 @@
 # leave the process or reach the logs.
 [privacy]
 # Master redaction switch ("private mode"). When true, only generic/sanitized
-# labels are emitted (no targets, no ai-title). Default: true
-#redact = true
+# labels are emitted (no targets, no ai-title). Default: false
+#redact = false
 # Absolute project paths whose activity is shown generically or hidden.
 # Default: empty.
 #blacklist_paths = ["/Users/you/private-project"]
@@ -120,3 +120,14 @@
 # env-assignments, credentialed URLs, and long base64/hex blobs) instead of being
 # dropped entirely. Default: false (bash args dropped).
 #scrub_bash_args = false
+
+# Finer per-field privacy toggles. Both default to true (the card shows the
+# project and the running command). `claude-presence install` can set these to
+# false for you (via --hide-project/--hide-command or its interactive prompts).
+[privacy.fields]
+# Show which project you're working in. When false, the project collapses to a
+# generic label and the git branch is suppressed. Default: true
+#project = true
+# Show the running command (Bash) target in the small-icon tooltip. When false,
+# only the bare verb ("Running") is shown. Default: true
+#command = true
