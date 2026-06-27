@@ -89,6 +89,23 @@ impl Aggregator {
             .iter()
             .fold(0u32, |acc, session| acc.saturating_add(session.subagents));
 
+        // When the multi-session card spans more than one distinct model, the
+        // `state` line shows a generic "{active_count} Agents" label instead of a
+        // single (focus-dependent) model name — picking one model would flicker as
+        // focus moves between models. Computed over the *active* sessions so it
+        // matches the "Working across N sessions" headline. `None` keeps the normal
+        // single-model rendering (single session, or a multi card all on one model).
+        let multi_agents = if displayed_multi {
+            let distinct: std::collections::BTreeSet<String> = sessions
+                .iter()
+                .filter(|session| is_active(session))
+                .map(|session| pretty_model(session.model.as_deref().unwrap_or("Claude")))
+                .collect();
+            (distinct.len() > 1).then_some(active_count)
+        } else {
+            None
+        };
+
         // Displayed metrics: summed across the active sessions for the multi card
         // (each session's tokens already include its live subagents), else the
         // focused session's own. Context % is per-session and never aggregates.
@@ -127,6 +144,7 @@ impl Aggregator {
             let state_inputs = StateInputs {
                 model: focused_session.model.clone(),
                 agent_count: total_subagents,
+                multi_agents,
                 cost: disp_cost,
                 tokens: disp_tokens,
                 ctx: disp_ctx,
@@ -371,8 +389,14 @@ struct StateInputs {
     /// Focused session model id (e.g. `claude-opus-4-8`); `None` → "Claude".
     model: Option<String>,
     /// Total live subagents across all sessions; `>0` renders an "N×" prefix on
-    /// the model (e.g. `20× Opus 4.8`), `0` renders none.
+    /// the model (e.g. `20× Opus 4.8`), `0` renders none. Ignored when
+    /// [`Self::multi_agents`] is set (the generic label carries no prefix).
     agent_count: u32,
+    /// When the multi-session card spans more than one distinct model, `Some(n)`
+    /// (n = active session count) renders the model slot as `"{n} Agents"` instead
+    /// of a model name, and suppresses the `agent_count` prefix. `None` keeps the
+    /// normal single-model rendering.
+    multi_agents: Option<u32>,
     /// Displayed cost (focused or combined), gated by `fields.cost`.
     cost: Option<f64>,
     /// Displayed token total incl. live subagents, gated by `fields.tokens`.
@@ -382,12 +406,27 @@ struct StateInputs {
 }
 
 fn format_state(cfg: &Config, inputs: &StateInputs) -> String {
-    let full_model = pretty_model(inputs.model.as_deref().unwrap_or("Claude"));
     let full_plan = cfg.plan_label.trim().to_string();
-    // "N×" prefix on the model carries the running-agent count (e.g. "20× Opus
-    // 4.8"); it stays attached through the model-abbreviation rungs below.
-    let prefix = (inputs.agent_count > 0).then(|| format!("{}\u{d7}", inputs.agent_count));
-    let prefix = prefix.as_deref();
+
+    // The model slot. When the multi-session card spans more than one distinct
+    // model (`multi_agents`), show a generic "{n} Agents" label — with no model
+    // name and no "N×" subagent prefix — rather than picking a single model that
+    // would flip as focus moves. Otherwise it's the focused model, optionally
+    // prefixed with the running subagent count ("N×", e.g. "20× Opus 4.8"), which
+    // stays attached through the abbreviation rungs below.
+    let (full_model, short_model, prefix_owned) = match inputs.multi_agents {
+        Some(n) => {
+            let label = format!("{n} Agents");
+            (label.clone(), label, None)
+        }
+        None => {
+            let full = pretty_model(inputs.model.as_deref().unwrap_or("Claude"));
+            let short = abbreviate_model(&full);
+            let prefix = (inputs.agent_count > 0).then(|| format!("{}\u{d7}", inputs.agent_count));
+            (full, short, prefix)
+        }
+    };
+    let prefix = prefix_owned.as_deref();
     let mut metrics = Metrics::build(cfg, inputs.cost, inputs.tokens, inputs.ctx);
 
     let mut state = state_with(prefix, &full_model, &full_plan, &metrics);
@@ -395,7 +434,6 @@ fn format_state(cfg: &Config, inputs: &StateInputs) -> String {
         return state;
     }
 
-    let short_model = abbreviate_model(&full_model);
     state = state_with(prefix, &short_model, &full_plan, &metrics);
     if char_count(&state) <= DISCORD_TEXT_LIMIT {
         return state;
@@ -834,6 +872,78 @@ mod tests {
     }
 
     #[test]
+    fn mixed_models_show_generic_agents_label() {
+        // 3× Opus 4.8 + 2× Sonnet 4.6, all active → the state model slot is a
+        // generic "5 Agents" label, never a single (focus-dependent) model name.
+        let mut cfg = Config::default();
+        cfg.assets.small_image = Some("claude".to_string());
+
+        let mut sessions = Vec::new();
+        for i in 0..3 {
+            sessions.push(session(&format!("opus{i}"), 10 + i));
+        }
+        for i in 0..2 {
+            let mut s = session(&format!("sonnet{i}"), 20 + i);
+            s.model = Some("claude-sonnet-4-6".to_string());
+            sessions.push(s);
+        }
+
+        let mut aggregator = Aggregator::new(cfg);
+        let PresenceUpdate::Activity(model) = aggregator.aggregate(sessions) else {
+            panic!("expected activity");
+        };
+
+        assert_eq!(model.details, "Working across 5 sessions");
+        // Generic agent label — never a specific model name that would flip as
+        // focus moves between the Opus and Sonnet sessions.
+        assert!(model.state.starts_with("5 Agents"), "{}", model.state);
+        assert!(!model.state.contains("Opus"), "{}", model.state);
+        assert!(!model.state.contains("Sonnet"), "{}", model.state);
+        assert_eq!(model.small_text.as_deref(), Some("5 active sessions"));
+    }
+
+    #[test]
+    fn same_model_multi_keeps_the_model_name() {
+        // Several sessions all on ONE model still show that model (not "Agents") —
+        // the generic label is only for genuinely mixed-model cards.
+        let mut cfg = Config::default();
+        cfg.assets.small_image = Some("claude".to_string());
+
+        let mut aggregator = Aggregator::new(cfg);
+        let PresenceUpdate::Activity(model) =
+            aggregator.aggregate(vec![session("a", 10), session("b", 20), session("c", 30)])
+        else {
+            panic!("expected activity");
+        };
+
+        assert_eq!(model.details, "Working across 3 sessions");
+        assert!(model.state.contains("Opus 4.8"), "{}", model.state);
+        assert!(!model.state.contains("Agents"), "{}", model.state);
+    }
+
+    #[test]
+    fn mixed_models_suppress_the_subagent_prefix() {
+        // With mixed models the generic "{n} Agents" label replaces the model, so
+        // the running-subagent "N×" prefix is dropped (it would read nonsensically).
+        let mut cfg = Config::default();
+        cfg.assets.small_image = Some("claude".to_string());
+
+        let mut opus = session("o", 10);
+        opus.subagents = 4;
+        let mut sonnet = session("s", 20);
+        sonnet.model = Some("claude-sonnet-4-6".to_string());
+        sonnet.subagents = 3;
+
+        let mut aggregator = Aggregator::new(cfg);
+        let PresenceUpdate::Activity(model) = aggregator.aggregate(vec![opus, sonnet]) else {
+            panic!("expected activity");
+        };
+
+        assert!(model.state.starts_with("2 Agents"), "{}", model.state);
+        assert!(!model.state.contains('\u{d7}'), "{}", model.state);
+    }
+
+    #[test]
     fn multi_session_timer_uses_earliest_start() {
         let mut early = session("a", 30_000);
         early.started_at = time(1_000);
@@ -922,6 +1032,7 @@ mod tests {
         let inputs = StateInputs {
             model: Some("claude-opus-4-8".to_string()),
             agent_count: 0,
+            multi_agents: None,
             cost: Some(0.98),
             tokens: Some(837_000),
             ctx: Some(8.3),
@@ -951,6 +1062,7 @@ mod tests {
         let inputs = StateInputs {
             model: Some("claude-opus-4-8".to_string()),
             agent_count: 0,
+            multi_agents: None,
             cost: Some(0.98),
             tokens: Some(837_000),
             ctx: Some(8.3),
