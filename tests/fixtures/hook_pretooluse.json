@@ -1,0 +1,12 @@
+{
+  "session_id": "d4f690f4-2701-4720-9274-b845c84cb78b",
+  "transcript_path": "/Users/redacted/.claude/projects/-redacted/d4f690f4.jsonl",
+  "cwd": "/Users/redacted/Projects/private",
+  "hook_event_name": "PreToolUse",
+  "permission_mode": "default",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "REDACTED",
+    "description": "REDACTED"
+  }
+}

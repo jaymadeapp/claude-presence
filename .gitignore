@@ -1,0 +1,8 @@
+# Rust build artifacts
+/target
+
+# macOS
+.DS_Store
+
+# Claude Code local (per-user) settings
+.claude/settings.local.json

@@ -1,0 +1,789 @@
+{
+  "summary": "Adversarial deep-verify the claude-presence spec docs (requirements/design/tasks/CLAUDE.md) before building",
+  "agentCount": 9,
+  "logs": [
+    "Review done: 8/8 dimensions reported"
+  ],
+  "result": {
+    "reviews": [
+      {
+        "dimension": "R1 — Requirements completeness & testability",
+        "verdict": "minor-issues",
+        "summary": "requirements.md is unusually well-grounded: every product-integration claim I could check against the live Claude Code v2.1.181 binary, the live ~/.claude state, and official Anthropic/Discord docs holds up — hook event names, statusLine JSON shapes (cost.total_cost_usd, context_window.context_window_size, model.display_name, effort.level), the session registry fields, the exe-path process filter, the 1M-vs-200k window table, and the Discord 5/20s rate limit are all confirmed. The FRs are largely atomic and testable and the FRs are achievable given the dossier. The defects are gaps, not falsehoods: (1) a genuine internal contradiction in how party.size is defined (busy vs running for element 0; configurable max vs total_live for element 1), which makes the headline \"(2 of 5)\" non-derivable; (2) several missing operational requirements (single-instance/already-running, empty/no-sessions state, Discord-not-running-at-startup, config reload semantics, log privacy); (3) a handful of non-objective ACs (<10ms latency, sub-second FS-watch) that need a measurement method. None block a build, but they should be fixed before design is frozen.",
+        "strengths": [
+          "Every Anthropic-product claim the requirements depend on is live-verified against the v2.1.181 binary, not assumed: all six hook events (SessionStart/PreToolUse/PostToolUse/Stop/SubagentStart/SubagentStop) appear in the Mach-O binary strings; the statusLine object shapes are present verbatim (cost:{total_cost_usd,total_duration_ms,...}, context_window:{...context_window_size,used_percentage}, model:{id,display_name}, effort:{level}); and the live ~/.claude/sessions/<PID>.json carries exactly pid/sessionId/cwd/startedAt/procStart/version/peerProtocol/kind/entrypoint as FR-1/AC-2 assumes.",
+          "FR-1/AC-1 exe-path filter is exactly right on the real machine: live ps shows the two engines at /…/claude-code/2.1.181/claude.app/Contents/MacOS/claude and the excluded Helpers/disclaimer + capital-C /Applications/Claude.app/…/MacOS/Claude GUI, matching the spec's exclusion list and the dossier's pgrep-truncation finding.",
+          "FR-3/AC-4's 1M-vs-200k window table is confirmed by official docs: Opus 4.8/4.7/4.6 and Sonnet 4.6 = 1M; Opus 4.5/Sonnet 4.5/Haiku 4.5 = 200k. The statusLine doc independently confirms context_window_size is '200000 by default, or 1000000 for models with extended' context, validating the 'prefer statusLine size' rule.",
+          "C-4/C-6/C-7 are real, well-scoped constraints that propagate into FRs, and the live settings.json confirms the concrete chaining targets the spec names: an existing Stop hook (afplay Submarine.aiff) and a statusLine.command both exist and must be preserved (FR-3/AC-1, FR-4/AC-1, C-6).",
+          "The FR-6/AC-5 Discord rate limit (~5/20s) matches official Discord docs (5 updates per 20 seconds), and FR-2's streaming-partial dedupe-on-message.id, busy/idle = pending tool_use heuristic, and 1M-window ctx% are all backed by verified-on-machine dossier facts."
+        ],
+        "missing_items": [
+          "Single-instance / already-running requirement: nothing in requirements.md (or design/tasks) prevents two daemon instances (e.g. launchd agent + a manual `run`) both pushing SET_ACTIVITY, which would double the update rate and thrash Discord's 5/20s limit. Need an AC for a pidfile/socket lock or detection of an existing instance.",
+          "Empty / no-sessions state: there is no AC defining what the card shows when zero live Claude Code sessions exist (clear presence? generic idle card? nothing?). FR-6/AC-2 only covers shutdown-clear.",
+          "Discord-not-running-at-startup: FR-6/AC-4 covers reconnect after a send failure, but no AC covers the daemon starting while Discord is closed (probe finds no socket) and then connecting once Discord launches.",
+          "Config reload semantics: FR-7 loads config and many ACs say values are 'configurable', but nothing states whether changes require a daemon restart or are hot-reloaded. Pick one and state it (even 'restart required' is fine as a testable statement).",
+          "Log privacy requirement: FR-8/AC-1 mandates 'rotating logs' but no AC constrains log content. C-7/NFR-3 forbid prompt/file/secret egress off-machine; logs are on-machine but a tracing line that records raw tool_input.command or full paths is a privacy footgun. Add an AC that the same sanitizers apply to logs (or explicitly scope logs out).",
+          "Startup ordering / collector-bootstrap order: design §ADR-1 says 'works with only the first source and upgrades fidelity', but no requirement states the daemon must render a usable card from sessions+transcript alone before statusline/hooks report (the MVP guarantee lives only in tasks.md milestone text, not as an AC)."
+        ],
+        "findings": [
+          {
+            "severity": "major",
+            "location": "requirements.md — Product goal line 19 vs FR-5/AC-2 line 99 (and design.md §4.3 line 131)",
+            "issue": "party.size is defined three inconsistent ways, so the headline example '(2 of 5)' is not objectively derivable. Product goal says element0 = 'how many sessions/agents are running' and element1 = max. FR-5/AC-2 says party.size = [busy_count, total_live_count] (element0 = busy, NOT running; element1 = total live) AND in the same line 'max/capacity is configurable'. Design §4.3 lists '[busy_count, max] or [busy_count, total_count]'. These cannot all be true: is the first number busy or running, and is the second the configured capacity or the live total?",
+            "evidence": "L19: 'party.size `[current, max]`: how many sessions/agents are running (renders \"(2 of 5)\")'. L99: 'AC-2 `party.size = [busy_count, total_live_count]`; max/capacity is configurable.' design.md L131: '`[busy_count, max]` or `[busy_count, total_count]`'. Dossier confirms 2 live sessions, busy/idle split varies — so '2 of 5' with 2 live sessions can only mean capacity=5, but FR-5/AC-2's total_live_count would make it '2 of 2'.",
+            "fix": "Pick one definition and make it consistent everywhere. Recommended: party.size = [busy_count, capacity] where capacity = configured `capacity/max` (FR-7/AC-1) falling back to total_live_count when capacity is unset. Rewrite FR-5/AC-2 to: '`party.size = [busy_count, capacity]`, where capacity is the configured max (default = total live session count).' Update the Product-goal line 19 to match (element0 = busy sessions, not 'running'), and collapse design §4.3 to the single chosen form.",
+            "confidence": "high"
+          },
+          {
+            "severity": "minor",
+            "location": "requirements.md — Product goal lines 14,19 vs FR-2/AC-6 line 68 and FR-5/AC-2 line 99",
+            "issue": "The card is described as counting 'sessions/agents' and assets reference subagents, but the party count (FR-5/AC-2) is built only from top-level sessions, while subagents are counted separately (FR-2/AC-6) and never feed party.size. It is undefined whether the '(N of M)' counter is meant to include in-process subagents. Per the dossier, subagents are NOT separate PIDs, so they cannot appear in the session set — yet the goal text implies 'agents' are counted.",
+            "evidence": "L14 'across all running Claude Code sessions'; L19 'how many sessions/agents are running'; FR-2/AC-6 'Count live subagents = subagents/**/agent-*.jsonl … subagents are in-process, not separate PIDs'; FR-5/AC-2 builds party from busy/total session counts only. Dossier B3: 'Subagents … are NOT separate OS processes … live subagent count is a recently-modified-sidechain-file count'.",
+            "fix": "State explicitly whether subagents contribute to party.size. Recommended AC under FR-5: 'party.size counts top-level sessions only; live subagent count is surfaced separately (e.g. appended to `state` or via small_text), never added to party.size.' Then fix the goal wording 'sessions/agents' → 'sessions' to avoid implying agents are in the party number.",
+            "confidence": "high"
+          },
+          {
+            "severity": "minor",
+            "location": "requirements.md FR-4/AC-3 line 92 and FR-2/AC-1 line 56; NFR-1 line 134",
+            "issue": "Several ACs assert quantitative timing/latency targets with no defined measurement method or pass condition, so they are not objectively testable as written: hook handler '<10ms' (FR-4/AC-3, NFR-1), FS-watch 'no polling' + 'incrementally' (FR-2/AC-1), debounce 'minimum ~2–3s' and keep-alive '~every 15s' (FR-6/AC-3 uses tildes).",
+            "evidence": "L92 'Hook handlers are fast (<10ms), non-blocking'; L134 'hook handler <10ms'; dossier A2 only documents '<50ms latency' for hooks generally, not <10ms — the spec's 10ms is tighter than any verified figure. FR-6/AC-3 L110 'minimum ~2–3s apart … (~every 15s)'.",
+            "fix": "For each timing AC, add a measurement basis and tolerance: e.g. 'hook forward subcommand returns in <10ms p95 measured by `time` over 100 invocations on the dev Mac; if unattainable, relax to <50ms (the documented hook budget)'. Replace tilde ranges in FR-6/AC-3 with concrete defaults already in design (min_interval=2.5s, keepalive=15s) and mark them configurable.",
+            "confidence": "medium"
+          },
+          {
+            "severity": "minor",
+            "location": "requirements.md FR-8/AC-1 line 123 (+ FR-7/AC-2, C-7, NFR-3)",
+            "issue": "FR-8/AC-1 requires 'rotating logs' but no requirement constrains what may be written to those logs. The privacy requirements (C-7, NFR-3, FR-7/AC-2) only forbid data leaving the machine; a tracing line logging raw tool_input.command or a full file path to the on-disk logfile would technically comply yet defeat the privacy intent and could persist secrets on disk.",
+            "evidence": "L123 'rotating logs' is the only log requirement. C-7 L35-36 'emits only structured, sanitized fields — never raw prompt/file content'. CLAUDE.md L22-23 already says 'never emit raw prompt text, file contents, or full paths (basename only)' but requirements.md has no log-content AC.",
+            "fix": "Add FR-8 AC: 'Logs MUST apply the same sanitizers as Discord output (paths→basename, redaction, blacklist); no raw prompt text, file contents, full paths, or secrets are written to logs at any level.' Or explicitly scope debug-level raw logging behind an opt-in flag that is off by default.",
+            "confidence": "medium"
+          },
+          {
+            "severity": "minor",
+            "location": "requirements.md — new requirement needed (relates to FR-8 lifecycle and FR-6/AC-5)",
+            "issue": "No single-instance guarantee. A launchd user agent plus an accidental foreground `claude-presence run` would produce two processes both connecting to discord-ipc-N and pushing SET_ACTIVITY, exceeding Discord's verified 5-updates/20s limit and blanking the presence — a concrete failure mode given FR-6/AC-5.",
+            "evidence": "FR-6/AC-5 (verified): Discord rate limit 5/20s (official docs confirm 'rate limit of 5 updates per 20 seconds'). No AC in FR-8 prevents concurrent instances; grep for single-instance/lock/pidfile across all three specs returns no real matches.",
+            "fix": "Add FR-8 AC: 'At most one daemon instance runs; on startup acquire an exclusive lock (flock on the state dir or bind-ownership of the ingest socket). If another live instance is detected, exit with a clear message (and `doctor` reports the conflict).'",
+            "confidence": "high"
+          },
+          {
+            "severity": "minor",
+            "location": "requirements.md FR-5 / FR-6 — empty-state behavior undefined",
+            "issue": "What the presence card shows when zero live Claude Code sessions exist is unspecified. FR-6/AC-2 only clears on shutdown; FR-5 always assumes a focused session exists ('focused session startedAt', 'most-recently-active'). With no sessions, focused index, started_at, details and state are undefined.",
+            "evidence": "FR-5/AC-1 'headline/\"focused\" session = most-recently-active' assumes ≥1 session; FR-5/AC-4 timestamps.start = 'focused session startedAt'. No AC covers total_count==0. grep for 'no session/empty/zero session' in requirements.md returns nothing.",
+            "fix": "Add FR-5 AC: 'When no live sessions exist, the daemon clears the Discord presence (sends activity:null) and holds it cleared until a session appears (configurable: clear vs show a generic idle card).' This also makes FR-5/AC-1's focus selection well-defined (no-focus case).",
+            "confidence": "high"
+          },
+          {
+            "severity": "nit",
+            "location": "requirements.md FR-6/AC-4 line 111 vs startup case",
+            "issue": "FR-6/AC-4 covers detecting a send failure and reconnecting, but the daemon-starts-while-Discord-is-closed case (initial probe of discord-ipc-0..9 finds nothing) is only implied, not an explicit AC. A tester cannot point to an AC for 'Discord launched after the daemon'.",
+            "evidence": "FR-6/AC-1 'connect to the first that handshakes'; FR-6/AC-4 'Detect send failure … reconnect with backoff'. Neither states behavior when the initial probe finds zero sockets. grep 'discord not running/startup order' returns nothing.",
+            "fix": "Extend FR-6/AC-1 or AC-4: 'If no IPC socket is available at startup, the daemon stays in a re-probe/backoff loop (no error exit) and connects automatically once Discord launches.'",
+            "confidence": "medium"
+          },
+          {
+            "severity": "nit",
+            "location": "requirements.md FR-1/AC-1 line 41-44",
+            "issue": "The filter is written with a literal placeholder '/claude-code/<ver>/'. A tester could read it as requiring a specific version. The intent (any version segment) should be explicit so the AC is testable across CLI upgrades — which is the whole point of the version-agnostic enumerator.",
+            "evidence": "L42 'path contains `/claude-code/<ver>/` and ends `/MacOS/claude`'. Live verification: both engines at /…/claude-code/2.1.181/claude.app/Contents/MacOS/claude; version segment varies by install.",
+            "fix": "Reword to: 'path contains `/claude-code/` followed by a version segment and ends with `/MacOS/claude` (version-agnostic; do not hard-code a version).'",
+            "confidence": "low"
+          },
+          {
+            "severity": "nit",
+            "location": "requirements.md FR-2/AC-4 line 63-64 vs FR-3 statusLine semantics",
+            "issue": "FR-2/AC-4 defines live context tokens = input + cache_read + cache_creation of the latest request. Official statusLine docs confirm used_percentage is computed input-only with exactly this formula (excluding output), so the fallback (FR-3/AC-3) and the statusLine path agree — but the requirement doesn't note that output_tokens are intentionally excluded, leaving room for an implementer to add them and diverge from statusLine's number.",
+            "evidence": "FR-2/AC-4: 'live context tokens = input + cache_read + cache_creation of the latest request'. statusLine doc: 'used_percentage is calculated from input tokens only: input_tokens + cache_creation_input_tokens + cache_read_input_tokens. It does not include output_tokens.' (verified via WebFetch of statusline.md).",
+            "fix": "Add a parenthetical to FR-2/AC-4: '(output_tokens deliberately excluded, to match Claude Code's own used_percentage computation).' This keeps the fallback consistent with the statusLine source it falls back from.",
+            "confidence": "medium"
+          }
+        ],
+        "_label": "R1-requirements"
+      },
+      {
+        "dimension": "R2 — Discord protocol + Rust crate API correctness (discord-rich-presence v1.1.0)",
+        "verdict": "major-issues",
+        "summary": "The crate choice is sound: discord-rich-presence v1.1.0 (vionya) really exists (latest stable, released 2026-01-26, ~330k downloads) and its builder exposes every field the spec maps — state, details, Timestamps::start(i64), Assets::{large_image,large_text,small_image,small_text}, Party::size([i32;2]), and Button::new(label,url) — plus the client methods connect/reconnect/set_activity/clear_activity/close. So nothing in the field mapping is unsendable; there is no blocking \"crate cannot send this field\" problem. However, three correctness defects must be fixed before code is written: (1) the timestamps unit is wrong — both Discord's docs and the crate's own 1.1.0 doc-comment say MILLISECONDS, but design.md §4.3 asserts \"epoch secs; verified seconds accepted\"; (2) the spec pins 1.1.0 but reuses the dossier's 0.2-era example code, and DiscordIpcClient::new changed from returning Result (0.2.x) to returning Self (1.1.0), so new(...)? will not compile; (3) party.size = [busy_count, …] makes the whole \"(N of M)\" counter vanish whenever busy_count is 0 (all sessions idle), because Discord treats current=0 as omitted. The known buttons-over-local-IPC caveat is also entirely unaddressed.",
+        "strengths": [
+          "discord-rich-presence v1.1.0 (vionya) is real and is the current max_stable_version on crates.io (released 2026-01-26, 330,666 total downloads) — verified via crates.io API; the dossier C1's version/date claim holds.",
+          "Every Activity field the spec maps is genuinely exposed by the 1.1.0 builder. Verified by downloading and reading the actual 1.1.0 source (/tmp/drp-110/discord-rich-presence-1.1.0/src/activity.rs): Activity::{state,details,timestamps,party,assets,buttons,...}, Timestamps::{start,end}(i64), Party::{id,size([i32;2])}, Assets::{large_image,large_text,small_image,small_text(+large_url,small_url)}, Button::new(label,url). party.size and buttons ARE exposed — no blocking 'unsendable field' problem.",
+          "The DiscordIpc trait in 1.1.0 provides exactly the lifecycle methods the design relies on: connect(), reconnect() (closes + reconnects + re-handshakes), set_activity(), clear_activity(), close() — verified in src/discord_ipc.rs. ADR-6 (run the sync client on a dedicated thread) is appropriate since the crate is synchronous.",
+          "Discord field limits are correct: details and state are capped at 128 chars (requirements C-3, design §4.3) — matches docs.discord.food/resources/presence. party.size officially renders as '(N of M)' and round-tripped live ([2,4]) in dossier lane C1/C2.",
+          "The crate's find_pipe() already iterates discord-ipc-0..9 across $XDG_RUNTIME_DIR/$TMPDIR/$TMP/$TEMP internally, so the design's 'probe ipc-0..9' is satisfied by the crate (verified in src/ipc_unix.rs)."
+        ],
+        "findings": [
+          {
+            "severity": "blocking",
+            "location": "design.md §4.3 (Discord Activity mapping table, `timestamps.start` row); requirements.md FR-5/AC-4 and product goal `timestamps.start`",
+            "issue": "timestamps.start unit is wrong. design.md states: 'focused session start (epoch secs; verified seconds accepted)'. Both authoritative sources say MILLISECONDS: the official Discord activity-timestamps docs (docs.discord.food/resources/presence) describe start/end as 'Unix time (in milliseconds)', and the pinned crate's OWN source documents the field as `/// Unix time (in milliseconds) of when the activity started` (src/activity.rs in 1.1.0). The dossier's C2 PoC happened to send seconds (`start(int(time.time()))`) and Discord echoed it back, but an echo is not a render check — a ~10-digit seconds value interpreted as ms is ~50,000x too small, which produces a grossly wrong elapsed timer (counting since ~1970). The dossier is internally inconsistent (its C1 limits table even says 'ms Unix ts' while its example code passes seconds). If implemented per design.md, the elapsed timer — a headline Codex-parity field — will be wrong.",
+            "evidence": "design.md §4.3: '`timestamps.start` | `started_at` | focused session start (epoch secs; verified seconds accepted)'. Crate 1.1.0 /tmp/drp-110/discord-rich-presence-1.1.0/src/activity.rs: 'start: Option<i64>' with doc '/// Unix time (in milliseconds) of when the activity started'. Official docs (docs.discord.food/resources/presence): start = 'Unix time (in milliseconds) of when the activity starts'.",
+            "fix": "In design.md §4.3 change the note to 'epoch MILLISECONDS (started_at as ms since epoch); Discord renders the elapsed timer from this'. Add an explicit conversion contract: PresenceModel.started_at: SystemTime → `Timestamps::new().start(dur.as_millis() as i64)`. Add a unit/acceptance check in tasks 2.1/2.2 that the value handed to the crate is in milliseconds (13 digits for current dates), and remove the false 'verified seconds accepted' clause.",
+            "confidence": "high"
+          },
+          {
+            "severity": "major",
+            "location": "design.md §2 (tech-stack table) & §4.3; tasks.md 0.1 and 2.2; research-dossier.json lane C1 'Verified builder signatures' and lane C2 'Rust PoC'",
+            "issue": "The spec pins discord-rich-presence 1.1.0 but the example/builder code it inherits from the dossier is 0.2-era and is API-incompatible with 1.1.0 in a way that will not compile. In 0.2.5, `DiscordIpcClient::new()` returns `Result<...>` (so `new(id)?` is correct); in 1.1.0 it returns `Self` (NON-fallible), so the dossier's `DiscordIpcClient::new(\"...\")?` does NOT compile. (Locally cached 0.2.5 confirms the old fallible signature; downloaded 1.1.0 confirms the new one.) Additionally `get_client_id` changed `&String`→`&str` and the public error type is now `discord_rich_presence::error::Error` (a thiserror enum) rather than `Box<dyn Error>`. A task agent copying the dossier's 'verified signatures' verbatim will write code that fails to build against the pinned version.",
+            "evidence": "1.1.0 src/ipc_unix.rs: 'pub fn new<T: AsRef<str>>(client_id: T) -> Self'; example presence.rs: 'let mut client = DiscordIpcClient::new(&args[1]);' (no `?`). 0.2.5 src/lib.rs hello-world + src/discord_ipc.rs use `DiscordIpcClient::new(...)?`. Dossier lane C1 example: 'let mut client = DiscordIpcClient::new(\"<APPLICATION_ID>\")?;' and lane C2: 'DiscordIpcClient::new(\"383226320970055681\")?' — both the 0.2 form.",
+            "fix": "Add a one-line note in design.md §2 (or §4.3) and tasks.md 2.2 that against 1.1.0: `DiscordIpcClient::new(id)` is infallible (returns Self, no `?`); methods return `discord_rich_presence::error::Error`; and the dossier's C1/C2 example snippets are 0.2-era and must be adapted. Pin precisely as `discord-rich-presence = \"=1.1.0\"` or `\"1.1\"` (already `\"1.1\"` in task 0.1 — acceptable) and have task 2.2's AC require a compile against 1.1.0.",
+            "confidence": "high"
+          },
+          {
+            "severity": "major",
+            "location": "design.md §4.3 (`party.size` row: '[busy_count, max] or [busy_count, total_count]'); requirements.md FR-5/AC-2 ('party.size = [busy_count, total_live_count]') and product goal ('how many sessions/agents are running')",
+            "issue": "Using busy_count as the party 'current' value makes the entire '(N of M)' counter DISAPPEAR whenever no session is actively running a tool. Discord treats party current=0 as omitting the party (documented: 'Sending 0 is the same as omitting it'), so the agent/session counter — an explicit user-requested headline element — vanishes exactly in the common idle state (e.g. you have 3 sessions open but none mid-tool). This also contradicts the stated intent that party.size shows how many sessions are *running/open*, not how many are *busy*.",
+            "evidence": "design.md §4.3: '`party.size` | `[busy_count, max]` or `[busy_count, total_count]`'. requirements.md FR-5/AC-2: '`party.size = [busy_count, total_live_count]`'. Web/docs (docs.discord.food/resources/presence; discord-rpc rich-presence-guide): party current of 0 is treated the same as omitting it, hiding the party text. Product goal: 'party.size [current, max]: how many sessions/agents are running (renders \"(2 of 5)\")'.",
+            "fix": "Change the party 'current' to total_live_count (or max(busy_count,1)/live-count) so the counter is always present, e.g. `party.size = [total_live_count, capacity]`, and convey busy/idle through state text or small_image instead. Update design.md §4.3 and requirements.md FR-5/AC-2 to '[live_count, capacity]' and add a note that current must be ≥1 to render. If busy-vs-total distinction is desired, encode it in `details`/`state`, not in party.current.",
+            "confidence": "high"
+          },
+          {
+            "severity": "major",
+            "location": "design.md §4.3 (`buttons` row) & §7 Risks table; requirements.md product goal ('optional buttons') and FR-7/PresenceModel.buttons; tasks.md 2.1",
+            "issue": "The known local-IPC buttons caveat is unaddressed. Two well-documented facts: (a) the canonical discord-rpc SET_ACTIVITY ('hard-mode') schema does not include a buttons field at all — buttons are a later addition with spotty local-RPC support; (b) buttons set via local RPC are NOT visible on your OWN profile, only to other users who share a server/friendship. Since this tool's whole point is the author seeing their own Codex-parity card, buttons may simply never appear for the user, and on some client states may not render via IPC at all. The spec markets 'optional buttons' and wires PresenceModel.buttons + 'set ... buttons' (task 2.1) with no caveat, risk entry, or doctor check.",
+            "evidence": "discord/discord-rpc hard-mode.md SET_ACTIVITY example lists state/details/timestamps/assets/party/secrets/instance — buttons absent (verified via fetch). Discord Social SDK 'Setting Rich Presence' docs + multiple implementations: 'Buttons are visible to others, but not yourself — Discord limitation.' design.md §7 risk table has no buttons row; §4.3 buttons row only says 'optional; from git remote / config'.",
+            "fix": "Add a §7 risk row: 'Buttons set over local IPC may not render on the user's own profile (and are absent from the classic SET_ACTIVITY schema) → keep buttons strictly optional/off by default, document the own-profile limitation, and add a doctor note.' In design.md §4.3 annotate the buttons row 'visible only to other users via local IPC; may not show on your own profile.' Default `buttons` empty in config (task 0.2) and word the README accordingly (task 5.3).",
+            "confidence": "high"
+          },
+          {
+            "severity": "minor",
+            "location": "design.md §3 module layout (discord/sink.rs 'connect ipc-0..9') & §1 diagram; requirements.md FR-6/AC-1; tasks.md 2.2",
+            "issue": "FR-6/AC-1 and the sink design imply the daemon will hand-probe discord-ipc-0..9 and 'connect to the first that handshakes with the configured client_id'. With the 1.1.0 crate, socket discovery (looping 0..9 across env dirs) is done INSIDE the crate's find_pipe()/connect(); the public API exposes no way to choose a specific socket index or to require a particular index. This isn't a defect (the crate's connect() does the probing), but the spec describes a probing/selection behavior the crate doesn't surface, which could mislead the implementer into trying to hand-roll socket selection on top of the crate.",
+            "evidence": "1.1.0 src/ipc_unix.rs find_pipe(): iterates ENV_KEYS then 'for i in 0..10 { format!(\"discord-ipc-{}\", i) }' and returns the first existing pipe; connect()/connect_ipc() use it. No public socket-index parameter. design.md §3: 'connect ipc-0..9'; requirements FR-6/AC-1: 'Probe discord-ipc-0..-9 ... connect to the first that handshakes'.",
+            "fix": "Note in design.md §3/§4.3 (or tasks 2.2) that socket probing across ipc-0..9 is performed by the crate's connect(); the sink should rely on connect()/reconnect() and treat IPCNotFound/IPCConnectionFailed as the retry trigger, rather than enumerating sockets itself. Optionally adjust FR-6/AC-1 wording to 'rely on the crate's 0..9 probe' so no hand-rolled socket selection is implied.",
+            "confidence": "medium"
+          },
+          {
+            "severity": "nit",
+            "location": "design.md §4.3 (assets rows) and dossier C1 limits table",
+            "issue": "Asset/url limit values in the dossier (large_image ≤313, *_url ≤256, party.id ≤128) are not restated in the spec, and the spec doesn't note that 1.1.0 additionally supports large_url/small_url/details_url/state_url/status_display_type/name (new in 1.x). Not a defect, but the design's Activity mapping omits these now-available fields (e.g. status_display_type could pick which line shows in the compact member list, and large_url/small_url give clickable images) — worth a sentence so they aren't 'rediscovered' later.",
+            "evidence": "1.1.0 src/activity.rs adds: name, state_url, details_url, large_url, small_url, status_display_type(StatusDisplayType{Name=0,State=1,Details=2}). design.md §4.3 maps only details/state/timestamps/party/assets(image+text)/buttons.",
+            "fix": "Optionally add a line to design.md §4.3 listing the extra 1.1.0 fields available (status_display_type, *_url, name) as future polish, and restate the asset/url char limits (large_image ≤313, *_url ≤256) alongside the ≤128 details/state limits for completeness.",
+            "confidence": "medium"
+          }
+        ],
+        "missing_items": [
+          "A documented unit contract for timestamps.start (milliseconds) and the SystemTime→i64-millis conversion, plus a test asserting the millisecond magnitude.",
+          "A note reconciling the dossier's 0.2-era example code (new(...)?, &String client id, Box<dyn Error>) with the pinned 1.1.0 API (new -> Self, error::Error), so task agents don't copy non-compiling snippets.",
+          "A risk-table entry and config default covering the local-IPC buttons limitation (not visible on own profile / absent from classic SET_ACTIVITY).",
+          "A rule that party.size 'current' must be >= 1 (or use live_count, not busy_count) so the agent counter doesn't disappear when idle.",
+          "Acknowledgement that socket probing (ipc-0..9) is handled inside the crate's connect()/find_pipe(), with IPCNotFound/IPCConnectionFailed as the reconnect trigger."
+        ],
+        "_label": "R2-discord-crate-api"
+      },
+      {
+        "dimension": "R3 — Claude Code Integration Correctness (Hook Events & StatusLine Schema)",
+        "verdict": "solid",
+        "summary": "The spec correctly references all major hook events and statusLine fields as documented in official Claude Code docs v2.1.181+. All six cited hook events exist and are correctly named. StatusLine fields mentioned (cost.total_cost_usd, context_window.used_percentage, context_window.context_window_size, model.display_name, version, effort.level, cost.total_duration_ms) are all present in the official schema. The research dossier validates these claims against live testing on the same machine. Opus 4.8 context window is correctly set to 1M (not 200k).",
+        "findings": [
+          {
+            "severity": "nit",
+            "location": "requirements.md FR-4/AC-1",
+            "issue": "Hook event enumeration incomplete: spec lists only 6 events (SessionStart, PreToolUse, PostToolUse, Stop, SubagentStart, SubagentStop), but omits documented events that may be needed",
+            "evidence": "Official hooks documentation at https://code.claude.com/docs/en/hooks.md lists 30+ events including SessionEnd, UserPromptSubmit, CwdChanged, ConfigChange, PreCompact, PostCompact, etc. The spec is not wrong but incomplete — it lists only the minimum useful subset.",
+            "fix": "Add a note in requirements.md FR-4/AC-1: 'Minimum required hooks for MVP activity tracking are SessionStart, PreToolUse, PostToolUse, Stop, SubagentStart, SubagentStop. Optional: CwdChanged (for project switching), SessionEnd (for cleanup).' This makes the intent explicit.",
+            "confidence": "high"
+          },
+          {
+            "severity": "blocking",
+            "location": "design.md § 5 'Algorithms' + requirements.md FR-3/AC-2",
+            "issue": "StatusLine field name discrepancy: spec says 'cost.total_duration_ms' but official docs say 'cost.total_duration_ms' (correct), however the spec ALSO references 'exceeds_200k_tokens' as a top-level field when it is actually nested",
+            "evidence": "Official statusLine.md available-data table shows 'exceeds_200k_tokens' is a top-level field (not nested under cost or context_window). Grep of research dossier confirms: 'exceeds_200k_tokens: false' at top level. Code example in statusline.md shows: '{...\"exceeds_200k_tokens\":false...}' — top-level, no nesting.",
+            "fix": "Spec is already correct. No change needed — 'exceeds_200k_tokens' is already referenced at top level in requirements.md FR-3/AC-2: 'extract... `exceeds_200k_tokens`' (no nesting mentioned). Status: verified correct.",
+            "confidence": "high"
+          },
+          {
+            "severity": "minor",
+            "location": "design.md § 4.2 'PresenceModel' Rust struct example",
+            "issue": "The sample Rust struct does not reflect the optional nature of statusLine fields: several fields (cost_usd, ctx_pct, tokens_total) should be Option<T> throughout the design to handle the fallback path when statusLine data is stale/absent",
+            "evidence": "Requirements.md FR-3/AC-3 explicitly states 'Fallback when statusLine data is absent/stale: compute cost from usage × pricing'. Design.md § 4.2 struct shows 'cost_usd: Option<f64>, ctx_pct: Option<f64>' which is correct, but the aggregate PresenceModel does not show how these transitions from None (computed from transcript) to Some (from statusLine override). This is a design completeness issue, not a spec error.",
+            "fix": "In design.md § 4.2, add a note: 'cost_usd, ctx_pct, tokens_total are Option<T>: they may be computed from transcript usage (fallback) or overridden by statusLine JSON when available. Aggregator merges both sources, preferring statusLine when present.' No code change needed; this is already handled in requirements.md FR-3/AC-3.",
+            "confidence": "medium"
+          },
+          {
+            "severity": "nit",
+            "location": "requirements.md C-4, design.md § 4",
+            "issue": "Spec claims 'the only Anthropic-stable contracts are the statusLine JSON and the hooks JSON' but does not list the version numbers or API stability guarantee",
+            "evidence": "Official docs do not explicitly state 'these JSON schemas are stable across versions'; instead they document the schema as-is. Research dossier confirms hooks/statusLine work on v2.1.181 but does not assert forward/backward compatibility guarantees. This is a documentation gap in the official docs, not a spec error.",
+            "fix": "Add to CLAUDE.md or design.md ADR-1: 'Stability assumption: hooks and statusLine JSON schemas are treated as stable (Anthropic-documented public contracts). If a breaking change occurs between Claude Code versions, this assumption fails and the daemon must degrade gracefully. Monitor docs/changelog for schema changes.' This is a risk mitigation, not a blocker.",
+            "confidence": "medium"
+          },
+          {
+            "severity": "major",
+            "location": "tasks.md Phase 3, task 3.3 'Hooks chain-install', AC-1",
+            "issue": "Task specifies 6 hooks to install: SessionStart, PreToolUse, PostToolUse, Stop, SubagentStart, SubagentStop. However, task 3.3 says 'add SessionStart/PreToolUse/PostToolUse/Stop/SubagentStart/SubagentStop hooks' — all 6 are listed correctly, BUT the note about 'chaining' assumes the user's existing hooks are hooks array objects. If the user has a `statusLine.command` WITHOUT hooks already configured, the chain-install logic must create the hooks array from scratch.",
+            "evidence": "Design.md § 2 shows install/ modules: 'install/hooks.rs: chain-install/uninstall hook scripts in settings.json (preserve existing)'. Requirements.md C-6 says 'MUST chain the user's existing config, never overwrite'. Task 3.3 AC-1 says 'ADD and exec any pre-existing hook command for that event (chain)'. This all assumes the hooks array exists; what if it doesn't? Research dossier shows user's ~/.claude/settings.json HAS a Stop hook, but a fresh user may not.",
+            "fix": "Update tasks.md 3.3 AC-1: 'Install hooks by reading the user's existing hooks array from settings.json; if the hooks[<EventName>] key doesn't exist, create it. For each event, append a new hook object {type:command, command:claude-presence forward --kind hook} without removing pre-existing hooks under that event.' Also: ensure install/hooks.rs handles missing hooks array gracefully (create empty array, then append).",
+            "confidence": "high"
+          },
+          {
+            "severity": "blocking",
+            "location": "tasks.md Phase 3, task 3.2 'statusline-wrapper chain-install'",
+            "issue": "Task 3.2 specifies installing a statusline-wrapper.sh that 'reads $CC_PRESENCE_INNER, runs it, tees stdin JSON to daemon socket'. However, there is no documented way to set environment variables in the hooks JSON that fire before statusLine command execution. The wrapper needs to receive the INNER command path, but how is this passed if not via env var?",
+            "evidence": "Official statusLine.md shows the settings.json structure: {statusLine: {type:command, command:<path>}} — there is no 'env' or 'innerCommand' field shown. Design.md § 3 says 'assets/statusline-wrapper.sh reads $CC_PRESENCE_INNER' but this assumes an env var is set. Requirements.md FR-3/AC-1 says 'reads the user's current statusLine.command from settings, invokes it and passes its stdout straight through'. The mechanism for passing the inner command to the wrapper is not specified.",
+            "fix": "Clarify in design.md § 3 (install/statusline.rs) and requirements.md FR-3/AC-1: 'The statusline-wrapper is installed as the new statusLine.command in settings.json. Before running the wrapper, the daemon reads the user's ORIGINAL statusLine.command from a backup file (~/.local/state/claude-presence/statusline-inner.sh or env var set by wrapper init) and exports it as CC_PRESENCE_INNER=/original/path. The wrapper reads this env var and execs the inner command, tee-ing stdin to the daemon socket.' OR use a simpler approach: 'Store the original command in a file and read it from the wrapper using the canonical path ~/.local/state/claude-presence/settings.backup.json (read-only).' This must be documented in install/statusline.rs acceptance criteria.",
+            "confidence": "high"
+          },
+          {
+            "severity": "minor",
+            "location": "design.md § 2, Technology stack table, Discord row",
+            "issue": "Design specifies `discord-rich-presence` v1.1.0 by vionya as the Discord crate, but the comment says '(vionya)' without explaining why this specific fork is chosen over the more widely-used `discord-rich-presence` v0.2 or later versions",
+            "evidence": "Crates.io lists multiple discord-rich-presence crates. Research dossier mentions 'discord-rich-presence crate (32K+ downloads/month)' without specifying version. Design.md says v1.1.0 (vionya) but provides no justification. This is a lower-risk detail but should be verified for actual availability.",
+            "fix": "Update design.md § 2 to note: 'discord-rich-presence v1.1.0 by vionya chosen for: [specify reason, e.g., active maintenance, macOS socket support]. Verify this crate is available at https://crates.io and add to Cargo.toml as discord-rich-presence = \"1.1\".' Alternatively, specify the full crate identifier if it's a scoped crate.",
+            "confidence": "medium"
+          },
+          {
+            "severity": "nit",
+            "location": "requirements.md FR-4/AC-1 and design.md § 3 Hook payload contract",
+            "issue": "Spec does not document the exact JSON structure of the hook event that is sent to the daemon socket. Design.md § 4.1 shows an example payload '{kind:hook, event:PreToolUse, session_id:..., tool_name:..., tool_input:{...}, ts:...}' but this is a SIMPLIFIED/SANITIZED version, not the full hooks JSON from Claude Code. The daemon must know which fields to extract from the raw hook JSON.",
+            "evidence": "Official hooks.md documents full PreToolUse payload including permission_mode, effort, etc. Design.md § 4.1 shows only {event, session_id, cwd, tool_name, tool_input}. This is intentional sanitization (C-7 privacy), but the schema adapter (task 1.1) must map from raw hooks JSON → sanitized ingest event.",
+            "fix": "Add to design.md § 4.1 (Daemon ingest socket): 'Hook events are received from hook-forward.sh as a SANITIZED subset of the official hooks JSON (extracted by the hook script using jq). The schema adapter (claude/schema.rs) parses raw hooks JSON from hook-forward.sh stdin; the ingest socket receives only the needed fields for activity/cost tracking (never raw prompt text, per C-7).' This clarifies the sanitization boundary.",
+            "confidence": "low"
+          }
+        ],
+        "missing_items": [
+          "Explicit test fixtures in tasks.md 1.1 for all 6 hook event types (SessionStart, PreToolUse, PostToolUse, Stop, SubagentStart, SubagentStop) — task says 'Unit-test against fixtures captured from specs/research-dossier.json' but does not list which fixture files to create",
+          "Error handling path for CwdChanged hook: spec installs CwdChanged as optional (design.md § 7 risks) but tasks.md does not include a task to parse and handle CwdChanged events in the aggregator",
+          "Versioning strategy for statusLine JSON and hooks JSON: spec claims they are 'stable' but does not document how the daemon will handle version bumps (graceful degradation per NFR-2 vs panic)",
+          "Daemon socket path finalization: design.md § 4.1 says '~/.local/state/claude-presence/daemon.sock (configurable)' but tasks.md does not specify task to implement the configurable socket path (TOML config, environment variable fallback)",
+          "Discord activity button field names: design.md § 4.3 references 'buttons' but Discord's Activity struct uses 'button' (singular) or 'buttons' (plural) — exact field name not verified against discord-rich-presence crate API"
+        ],
+        "strengths": [
+          "All 6 hook events specified exist and are correctly documented (SessionStart, PreToolUse, PostToolUse, Stop, SubagentStart, SubagentStop). Verified against official hooks.md.",
+          "StatusLine JSON schema is correctly transcribed: cost.total_cost_usd, context_window.used_percentage, context_window.context_window_size, model.display_name, version, effort.level, cost.total_duration_ms all exist.",
+          "Opus 4.8 context window size correctly set to 1M tokens (not 200k). This critical fact is verified in CLAUDE.md and research dossier.",
+          "Hook stdin JSON fields specified in design.md § 4.1 (session_id, cwd, tool_name, tool_input, hook_event_name) are all present in official hooks.md schema.",
+          "Transcript fields (message.model, message.usage names: input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, gitBranch, isSidechain, message.id) verified in research dossier lane A1.",
+          "Chain-install strategy (never overwrite, always preserve existing hooks/statusLine) is architecturally sound and aligns with C-6 constraint.",
+          "Research dossier provides deep verification: live session testing, exact payload examples, field-by-field validation against running Claude Code v2.1.181 on the author's machine."
+        ],
+        "_label": "R3-claudecode-integration"
+      },
+      {
+        "dimension": "R4 — Rust architecture & crate ecosystem soundness",
+        "verdict": "minor-issues",
+        "summary": "The crate selection is sound and the architecture is buildable. Every named dependency exists on crates.io, none of the pinned versions are yanked, and I live-compiled the highest-risk pieces on this Mac (cargo 1.95.0): sysinfo 0.39 enumerated both live Claude engine PIDs by exe-path filter and returned populated cwd()/exe()/start_time()/cpu_usage(); nix 0.31 kill(pid,None) liveness works; libproc 0.14 is usable; the discord-rich-presence 1.1 sink on a dedicated std::thread fed by a tokio::sync::watch channel type-checks with Activity<'a> borrowing from an owned model (no borrow-checker fight); and the ADR-9 dependency-free UnixStream round-trip compiles and runs with pure std (a shell script piping stdin into `claude-presence forward` is genuinely workable). The issues are real but contained: (1) design.md §2 presents sysinfo exe()/cwd()/cmd() as bare method calls but on sysinfo 0.30+ these fields are NOT populated unless you pass ProcessRefreshKind::with_cwd/with_exe(UpdateKind) at refresh time — an implementer following the table verbatim will get empty cwd and silently fall through to libproc on every process; (2) the research dossier's \"verified\" discord snippet uses DiscordIpcClient::new(...)? but that test ran against v0.2 — in the pinned v1.1, new() returns Self, not Result, so copied code won't compile; (3) notify is never version-pinned in design §2 or tasks 0.1 despite the project's stated pinning discipline (cargo resolves it to 8.2.0, skipping the 9.0.0-rc prerelease, so it works, but it should be explicit). Everything else (hook event names incl. SubagentStart, statusLine field identifiers, session registry shape) is grounded in the actual CLI binary.",
+        "strengths": [
+          "All 17 named crates exist on crates.io and none of the pinned/latest versions are yanked (verified via sparse index): discord-rich-presence 1.1.0, sysinfo 0.39.3, notify 8.2.0, libproc 0.14.11, nix 0.31.3, tray-icon 0.24.1, tao 0.35.3, clap 4.6.1, tokio 1.52.3, etc.",
+          "ADR-6 concurrency design is sound and idiomatic: I compiled the exact shape (sync DiscordIpcClient on a dedicated std::thread, fed by tokio::sync::watch carrying an owned String-field model, Activity<'a> built by borrowing from that local owned model). No Send/borrow-checker problem because Activity never crosses the channel — only the owned model does. The design.md §4.2 PresenceModel already uses owned String/Vec fields, which is exactly what makes this work.",
+          "ADR-9 dependency-free claim is correct and live-verified: a pure-std UnixStream::connect + write_all + shutdown round-trip compiled and ran (server received the JSON) with zero extra crates. The `forward` subcommand reading stdin and writing to a UnixStream is trivially workable from a shell script.",
+          "Live-verified on this Mac that sysinfo 0.39's exe-path filter (`contains /claude-code/ && ends_with /MacOS/claude`) correctly isolates the two engine PIDs (98608, 98863) and excludes the /Applications/Claude.app GUI — the FR-1/AC-1 filter is accurate against real process exe paths.",
+          "sysinfo cwd() IS available on macOS without elevation (returned the real project dirs for both engine PIDs once with_cwd was requested), validating the design's reliance on it with libproc only as a fallback.",
+          "Hook event names in FR-4/AC-1 are all real: grepped the CLI binary's HOOK_EVENT_REGISTRY and confirmed PreToolUse, PostToolUse, Stop, SubagentStop, SessionStart, and SubagentStart (executeSubagentStartHooks/d$t) all exist as configurable events.",
+          "statusLine JSON identifiers in FR-3/AC-2 are all present in the binary (total_cost_usd, used_percentage, context_window_size, total_duration_ms, display_name, StatusLineCommandInput), and the sessions/<PID>.json registry exists with the assumed pid/sessionId/cwd/startedAt/version/entrypoint keys."
+        ],
+        "findings": [
+          {
+            "severity": "major",
+            "location": "design.md §2 Technology stack table (Process enum / cwd fallback rows) and tasks.md 1.3",
+            "issue": "The design lists sysinfo accessors as bare calls — `sysinfo (exe(), cwd(), cpu_usage(), start_time())` — implying cwd/exe are available after a normal refresh. On sysinfo 0.30+ (pinned 0.39.3) these fields are NOT populated by default; cwd/exe/cmd require ProcessRefreshKind::with_cwd(UpdateKind)/with_exe(UpdateKind) and cpu requires with_cpu() passed to refresh_processes_specifics(...). An implementer following the table will call System::new_all() or a default refresh, get cwd()==None for every process, and silently fall through to the libproc path on 100% of sessions (defeating the 'sysinfo worked, libproc not required' premise from the dossier).",
+            "evidence": "docs.rs/sysinfo/0.39.3 ProcessRefreshKind: 'Fields like cwd, exe, and cmd are not populated by default ... You must explicitly request these fields using the with_* methods.' Live-confirmed on this Mac: my probe only got cwd=Some(\"/Users/.../Projects/private\") for PIDs 98608/98863 AFTER calling ProcessRefreshKind::nothing().with_exe(UpdateKind::Always).with_cwd(UpdateKind::Always).with_cpu() — without it cwd is empty.",
+            "fix": "In design.md §2, change the Process-enum row to note the refresh-kind requirement, e.g. 'sysinfo — refresh with ProcessRefreshKind::nothing().with_exe(UpdateKind::Always).with_cwd(UpdateKind::Always).with_cpu(), then exe()/cwd()/cpu_usage()/start_time()'. Add the same note to tasks.md 1.3 so the agent wires ProcessesToUpdate::All + the explicit ProcessRefreshKind. Also note cpu_usage() needs two refreshes spaced by MINIMUM_CPU_UPDATE_INTERVAL to be non-zero (my single-shot probe printed cpu=0).",
+            "confidence": "high"
+          },
+          {
+            "severity": "major",
+            "location": "specs/research-dossier.json (verified discord snippet) vs design.md §2 / tasks.md 0.1 (discord-rich-presence = \"1.1\")",
+            "issue": "The dossier's 'verified builder signatures' show `let mut client = DiscordIpcClient::new(\"<APPLICATION_ID>\")?;` — i.e. new() returning a Result. That live test was run against discord-rich-presence \"0.2\" (the dossier explicitly says client_id ... with discord-rich-presence='0.2'). In the pinned v1.1, new() was changed in the 1.0.0 breaking release to return Self, not Result. Any implementer copying the dossier/`?` idiom into the v1.1 codebase will hit a compile error (the `?` operator cannot be applied to a non-Result/Option value).",
+            "evidence": "docs.rs/discord-rich-presence/1.1.0 DiscordIpcClient::new signature is `pub fn new<T: AsRef<str>>(client_id: T) -> Self`. vionya release notes (v1.0.0): new() no longer returns Result. Live-confirmed: my probe compiled `DiscordIpcClient::new(\"383226320970055681\")` WITHOUT `?` against discord-rich-presence 1.1.0; the dossier snippet uses `new(...)?`.",
+            "fix": "Add a one-line note to design.md §2 (discord row) or a 'pitfalls' note in tasks.md 2.2: 'discord-rich-presence v1.1 DiscordIpcClient::new() returns Self (not Result) — the dossier code samples use the v0.2 `new()?` form; drop the `?`. connect()/set_activity()/clear_activity()/reconnect()/close() do return Result<(), discord_rich_presence::error::Error>.'",
+            "confidence": "high"
+          },
+          {
+            "severity": "minor",
+            "location": "design.md §2 (FS watching row) and tasks.md 0.1 dependency list",
+            "issue": "notify is the only core runtime dependency with no version pin, in a project whose CLAUDE.md and specs emphasize version-pinned reproducibility. crates.io's latest notify is a prerelease (9.0.0-rc.4); a bare `notify` or `notify = \"*\"` resolves to 8.2.0 today (cargo skips prereleases), but leaving it unpinned risks an accidental 9.x pickup once 9.0 ships and is a stated-discipline violation.",
+            "evidence": "crates.io sparse index: notify latest=9.0.0-rc.4 (prerelease), last stable=8.2.0. Live: `notify = \"*\"` in my probe resolved to notify v8.2.0. tasks.md 0.1 lists 'notify' with no version; design.md §2 lists 'notify' with no version (unlike discord-rich-presence which is pinned to v1.1.0).",
+            "fix": "Pin in design.md §2 and tasks.md 0.1: `notify = \"8\"` (or `\"8.2\"`). Optionally add a note that 9.0 is still RC as of 2026-06.",
+            "confidence": "high"
+          },
+          {
+            "severity": "minor",
+            "location": "design.md §1 architecture diagram comment ('FS events (notify) ► ... $TMPDIR for discord socket creation') and §2",
+            "issue": "The architecture narrative implies notify is used to watch $TMPDIR for discord-ipc-N socket *creation*. FSEvents/notify report directory-content changes, but Discord IPC endpoints are unix-domain sockets whose appearance you'd then connect() to; the actual sink design (FR-6/AC-1, ADR re reconnect) just probes ipc-0..9 with backoff. Watching $TMPDIR for socket creation is neither specified as a task nor necessary, and FSEvents coalescing makes it an unreliable trigger for 'Discord just started'. This is a doc/architecture inconsistency, not a code blocker.",
+            "evidence": "design.md §1 left-margin comment lists notify feeding '$TMPDIR discord sockets' but §4/FR-6 and tasks.md 2.2 describe sink reconnect purely as probe ipc-0..9 with backoff on send failure — no notify watch on $TMPDIR appears in any task.",
+            "fix": "Either drop the '$TMPDIR for discord socket creation' from the notify description in design.md §1 (keep notify scoped to transcript/subagent file watching, which is what tasks 1.5 actually implement), or add an explicit task + acceptance criterion if socket-creation watching is truly intended.",
+            "confidence": "medium"
+          },
+          {
+            "severity": "minor",
+            "location": "design.md §2 (Tray row) and tasks.md 5.2",
+            "issue": "tray-icon + tao on macOS require the event loop (and tray creation) to run on the main thread; tao/winit panic if EventLoop is constructed off the main thread. A tokio-driven daemon whose main() is `#[tokio::main]` runs app logic on a runtime worker, so the tray feature must keep main() as the OS main thread and move the tokio runtime onto a spawned thread (or use EventLoopBuilder + run on main). The design notes tray is optional/feature-gated but does not flag this main-thread constraint, which is the single most common tray-icon integration failure.",
+            "evidence": "tray-icon/tao docs and common usage require main-thread event loop on macOS; verified tray-icon 0.24.1 + tao 0.35.3 compile on edition 2021 / rustc 1.95 in my probe, but compilation does not exercise the runtime main-thread requirement.",
+            "fix": "Add a note to tasks.md 5.2 / design.md §2 tray row: 'macOS requires the tao EventLoop and TrayIcon on the main thread; under #[tokio::main] move the runtime to a spawned thread and run the event loop on main, or build the runtime manually.'",
+            "confidence": "medium"
+          },
+          {
+            "severity": "nit",
+            "location": "design.md §2 (Discord row: 'proven live on this Mac') / research-dossier.json",
+            "issue": "The 'proven live on this Mac' claim for discord-rich-presence was established with v0.2 (0.2 connect/set/clear/close), not the pinned v1.1. The trait surface (connect/reconnect/close/set_activity/clear_activity) is identical, so the claim holds in spirit, but the live proof and the pinned version differ by a major release.",
+            "evidence": "dossier: 'temp project with discord-rich-presence=\"0.2\" printed RUST: connected / set_activity OK / cleared + closed OK'. design.md §2 pins v1.1.0.",
+            "fix": "Optionally re-run the 5-line live smoke test against v1.1 before implementation, or soften the wording to 'API proven live (v0.2); v1.1 keeps the same DiscordIpc trait, only new() changed from Result to Self.'",
+            "confidence": "low"
+          }
+        ],
+        "missing_items": [
+          "No MSRV is declared anywhere (CLAUDE.md says 'Edition 2021' but no rust-version). Several deps move fast (sysinfo, nix, clap 4.6); pinning an MSRV in Cargo.toml would protect the build. Note this Mac has rustc 1.95.0 which builds everything fine.",
+          "tasks.md 0.1 lists deps but omits thiserror, which CLAUDE.md mandates ('Prefer thiserror for errors'). thiserror 2.0.18 exists and is pulled transitively anyway, but it should be an explicit direct dependency in the 0.1 task list.",
+          "No dependency on a crate for incremental file tailing offset tracking beyond notify (transcript.rs in task 1.5 must track per-file read offsets via std::fs::File::seek) — fine to do with std, but worth noting std::io::Seek is the intended mechanism so an agent doesn't reach for an unneeded crate.",
+          "The design does not state how the tokio unix-socket server (ingest/socket.rs, task 3.1) interoperates with the std UnixStream written by the `forward` subcommand — they are compatible (both are AF_UNIX SOCK_STREAM), but a one-line note that the daemon uses tokio::net::UnixListener while forward uses std::os::unix::net::UnixStream would prevent an agent from assuming both must use the same crate."
+        ],
+        "_label": "R4-rust-architecture"
+      },
+      {
+        "dimension": "R5 — Task graph integrity",
+        "verdict": "major-issues",
+        "summary": "The declared Depends graph is acyclic and AC traceability is almost complete (every task AC reference resolves to a real AC; no orphan references). However there is one BLOCKING parallel-safety collision: tasks 2.3 and 3.1 both write src/main.rs but neither depends on the other, so the orchestrator can run them in the same wave and clobber main.rs. There is also a real type-ownership inversion: SessionState/Activity are owned by 2.1 (src/state/model.rs) yet are produced/emitted by upstream tasks 1.4 and 1.5 — there is no producer task for these shared types before their consumers, and wiring them into model.rs would create a 1.4→1.5→2.1→1.4 inversion. Several supporting tasks are missing (shared error/Result type, logging init owner, git-remote read for buttons, an integration/e2e test). The Phase 0-2 = MVP claim is valid: 2.3 transitively pulls sessions(1.3)+transcript(1.5)+pricing fallback(1.2)+aggregator(2.1)+sink(2.2), producing a visible card with no statusLine/hooks. All hook event names, the exe-path filter, statusLine field names, and the worked cost example were live-verified against the v2.1.181 binary and the dossier.",
+        "strengths": [
+          "Declared Depends graph verified acyclic (DFS over all 19 tasks, no back-edges).",
+          "AC traceability one-way is clean: every FR/AC token referenced in tasks.md resolves to a real AC in requirements.md — no dangling references.",
+          "File-overlap mostly serialized correctly: install/launchd.rs (4.1/4.2), install/hooks.rs (3.3/4.2), install/statusline.rs (3.2/4.2), privacy.rs (0.2/5.1 transitively), Cargo.toml (0.1/5.2 transitively) are all ordered by Depends.",
+          "Phase 0-2 = MVP claim holds: 2.3's transitive closure includes the full sessions+transcript+pricing+aggregator+sink chain, yielding a visible card with zero statusLine/hooks (confirmed by topological reachability).",
+          "Technical grounding solid: all six hook event names (SessionStart/PreToolUse/PostToolUse/Stop/SubagentStart/SubagentStop) exist in the v2.1.181 binary; the exe-path filter (/claude-code/<ver>/.../MacOS/claude) matches the live install path; statusLine field names (total_cost_usd, used_percentage, context_window_size, total_duration_ms, display_name) all present; the 1.2 worked example (131*5+12570*25+59709*0.5+10493*10)/1e6=$0.449690 matches the dossier exactly."
+        ],
+        "findings": [
+          {
+            "severity": "blocking",
+            "location": "tasks.md 2.3 and 3.1 (Files/Depends)",
+            "issue": "Tasks 2.3 (Files: src/main.rs, Depends: 2.2) and 3.1 (Files: src/ingest/socket.rs, src/ingest/events.rs, src/main.rs, Depends: 2.1) both WRITE src/main.rs but neither depends on the other. The executing-plans orchestrator schedules a task as soon as its declared Depends complete (ready-set, not wave-number). 3.1 becomes ready right after 2.1, the same time as 2.2 — it does NOT wait for 2.3. So 2.3 (wiring `run` end-to-end) and 3.1 (adding the `forward` subcommand + booting the ingest server in main) can run concurrently and the second writer clobbers the first's main.rs edits.",
+            "evidence": "tasks.md L99 `2.3 ... Files: src/main.rs ... Depends: 2.2`; tasks.md L110-111 `3.1 ... Files: src/ingest/socket.rs, src/ingest/events.rs, src/main.rs ... Depends: 2.1`. Programmatic reachability check: no path 2.3->3.1 or 3.1->2.3 → UNORDERED parallel collision on src/main.rs.",
+            "fix": "Add `2.3` to task 3.1's Depends line (change `**Depends**: 2.1` to `**Depends**: 2.1, 2.3` in tasks.md L111). This serializes the two main.rs writers without adding any false dependency on 3.1's own logic (3.1 only needs the aggregator from 2.1, but must edit main.rs after 2.3 has established the `run` wiring). Alternatively, move the ingest-server boot wiring out of 3.1's main.rs edits into 2.3 and give 3.1 only the ingest/* files — but the Depends edit is the minimal fix.",
+            "confidence": "high"
+          },
+          {
+            "severity": "major",
+            "location": "tasks.md 1.4 and 1.5 vs 2.1 (type ownership) / design.md §3 L74, §4.2 L111-116",
+            "issue": "`SessionState` and `Activity` are defined in src/state/model.rs, which is owned exclusively by task 2.1. But task 1.4 (Files: src/claude/activity.rs only) is specified to produce the `Activity` value {verb,target,small_image_key}, and task 1.5 (Files: src/claude/transcript.rs only) is told to 'Emit `SessionState` updates'. Both 1.4 and 1.5 are upstream of 2.1 (2.1 Depends: 1.3,1.5). So the shared types these tasks consume/produce have no owning task before their consumers, and putting them in model.rs (per design §3) would invert the dependency (2.1 would have to exist before 1.4/1.5, but 2.1 depends on 1.5). A fresh agent on 1.5 cannot compile against a `SessionState` type that doesn't exist yet and isn't in its Files.",
+            "evidence": "design.md §3 L74 `model.rs  PresenceModel + SessionState`; design.md §4.2 L111 `struct SessionState {...}` L114 `activity: Option<Activity>`; tasks.md L72 `1.5 ... Emit `SessionState` updates` Files L74 `src/claude/transcript.rs`; tasks.md L66 `1.4 ... Files: src/claude/activity.rs`; tasks.md L84 `2.1 ... Files: src/state/model.rs ... Depends: 1.3, 1.5`.",
+            "fix": "Move the core shared types into an early task. Either: (a) add `src/state/model.rs` (defining SessionState + Activity only) to task 0.2 or a new task 0.3 that 1.4/1.5/2.1 all Depend on; or (b) reassign `src/state/model.rs` to task 1.5's Files and have 2.1 only own `src/state/aggregator.rs`, adding `src/state/model.rs` is created by whichever of 1.4/1.5 is earliest. Concretely: create task `0.3 Core domain types` with Files `src/state/model.rs` (SessionState, Activity, PresenceModel skeleton), Depends 0.1; then add 0.3 to Depends of 1.4, 1.5, and 2.1, and remove src/state/model.rs from 2.1's Files (2.1 keeps only aggregator.rs).",
+            "confidence": "high"
+          },
+          {
+            "severity": "major",
+            "location": "tasks.md 1.1 AC line L36",
+            "issue": "Task 1.1 claims `FR-3/AC-2` as one of its ACs, but FR-3/AC-2 (requirements.md L75-77) is 'From statusLine JSON, extract cost.total_cost_usd, context_window.used_percentage, context_window.context_window_size, model.display_name, version, effort level, cost.total_duration_ms' — that is field-extraction/consumption semantics, which is actually implemented by task 3.1 (ingest, which maps statusLine→overrides). Task 1.1 only builds the serde struct/adapter, not the extraction-into-the-model. Meanwhile task 3.1 (L109) lists FR-3/AC-1, FR-4/AC-1, FR-4/AC-3 but NOT FR-3/AC-2, so the actual field-extraction AC is traced to a task (1.1) that doesn't perform it, and the task that does (3.1) doesn't claim it.",
+            "evidence": "tasks.md L36 `1.1 ... AC: FR-2/AC-3, FR-2/AC-4, FR-3/AC-2, C-4`; requirements.md L75 `AC-2 From statusLine JSON, extract cost.total_cost_usd ...`; tasks.md L107-109 `3.1 ... statusLine overrides computed cost/ctx%/model ... AC: FR-3/AC-1, FR-4/AC-1, FR-4/AC-3`.",
+            "fix": "Move `FR-3/AC-2` from task 1.1's AC list to task 3.1's AC list (it is 3.1 that extracts/overrides cost/ctx%/model from statusLine JSON). If 1.1 should still own the *parsing* of those fields, keep it but make 3.1 also list FR-3/AC-2 so the extraction-into-aggregator behavior has a clear owner.",
+            "confidence": "medium"
+          },
+          {
+            "severity": "major",
+            "location": "tasks.md (whole graph) — missing tasks",
+            "issue": "Several cross-cutting deliverables required by requirements/design have no owning task: (1) a shared error/Result type — CLAUDE.md mandates `thiserror` and 'no unwrap()/expect() on runtime paths', but no task creates the error enum; (2) logging/tracing-subscriber INIT — 0.1 only adds the dep; FR-8/AC-1 ('rotating logs') and 2.3 ('logs via tracing') assume an initialized subscriber with no owning task; (3) git-remote read for buttons — design §4.3 L134 'buttons: optional; from git remote / config' and 2.1 'set ... buttons', but no task reads the git remote; (4) an integration/e2e test exercising the full sessions→aggregator→sink path (only unit tests on 1.1/1.2/5.1 exist).",
+            "evidence": "CLAUDE.md 'Prefer thiserror for errors ... No unwrap()/expect() on runtime paths'; requirements.md L123 FR-8/AC-1 'with rotating logs'; tasks.md L97 '2.3 ... logs via tracing'; design.md §4.3 L134 'buttons ... from git remote / config'; grep of tasks.md for thiserror/logging init/git remote/integration test → no owners found.",
+            "fix": "Add tasks: `0.3/0.4 Error type + logging init` (Files: src/error.rs, src/logging.rs; Depends 0.1; owns the thiserror enum and tracing-subscriber init incl. rotating file appender) — make 2.3 and 4.1 Depend on it. Add git-remote button derivation to 2.1's scope explicitly (extend its body to read `git remote get-url origin` via the platform module, or add a small task under platform/macos.rs). Add task `2.4 e2e smoke test` (Files: tests/e2e.rs; Depends 2.3) feeding fixture sessions through the aggregator and asserting a non-empty PresenceModel.",
+            "confidence": "high"
+          },
+          {
+            "severity": "minor",
+            "location": "tasks.md 1.5 (Files) vs 1.1 (tests/fixtures ownership)",
+            "issue": "Task 1.5 says 'Unit-test ... derive ... state' and 1.2 says 'Unit-test the worked example'; both presumably need transcript/usage fixtures, but only task 1.1 owns `tests/fixtures/`. If 1.5 (wave 4) or 1.2 (wave 2) must add a fixture file under tests/fixtures/, that directory is owned by 1.1. 1.5 transitively depends on 1.1 so it's safe, but 1.2 runs in the SAME wave as 1.1 (both Depend only on 0.1) and if 1.2 needs a fixture file it would collide with 1.1's tests/fixtures/ writes.",
+            "evidence": "tasks.md L37 `1.1 Files: src/claude/schema.rs, tests/fixtures/`; tasks.md L45 `1.2 ... Unit-test the worked example`; both `Depends: 0.1` (same wave 2 per topo computation).",
+            "fix": "Either declare 1.2's worked-example test as inline (no fixture file — recommended, it's pure arithmetic) and note that in 1.2's body, OR add `tests/fixtures/` to 1.2's Files and make 1.2 Depend on 1.1 to serialize fixture-dir writes. Also add tests/fixtures/ to 1.5's Files if 1.5 captures its own transcript fixtures (it already transitively depends on 1.1, so just listing the dir documents the shared ownership).",
+            "confidence": "medium"
+          },
+          {
+            "severity": "minor",
+            "location": "tasks.md 1.5 and 2.2 (granularity)",
+            "issue": "Two tasks are noticeably larger than the ~<200-line target and bundle multiple non-trivial concerns. 1.5 (transcript watcher) does: notify setup, incremental byte-offset tailing, truncated-line tolerance, message.id partial dedup, model/branch/token/live-context derivation, busy/idle classification, AND subagent counting (6 ACs: FR-2/AC-1,2,5,6). 2.2 (Discord sink) does: socket probing 0..9, handshake, SET_ACTIVITY, dedicated-thread plumbing, debounce, keepalive, reconnect+backoff, rate-limit (5 ACs: FR-6/AC-1..5).",
+            "evidence": "tasks.md L68-75 (1.5, ACs FR-2/AC-1,2,5,6) and L87-93 (2.2, ACs FR-6/AC-1..5).",
+            "fix": "Split 1.5 into `1.5a transcript tail + incremental parse + dedup` (FR-2/AC-1,2) and `1.5b derive per-session state: model/branch/tokens/busy-idle/subagent-count` (FR-2/AC-5,6); both Files src/claude/transcript.rs so 1.5b Depends 1.5a. Split 2.2 into `2.2a connect/handshake/SET_ACTIVITY/clear` (FR-6/AC-1,2) and `2.2b reconnect/backoff/debounce/keepalive/rate-limit` (FR-6/AC-3,4,5), 2.2b Depends 2.2a, both in src/discord/sink.rs.",
+            "confidence": "medium"
+          },
+          {
+            "severity": "minor",
+            "location": "tasks.md 4.2 (Files) and 4.1 (launchd ownership)",
+            "issue": "Task 4.2 lists src/install/launchd.rs, src/install/hooks.rs, src/install/statusline.rs in its Files and is marked Scope: broad. It re-touches three install modules owned by 4.1/3.3/3.2. It correctly Depends on all three so there is no parallel collision, but 4.2 'composes' them — if it only calls their public APIs it should NOT list them in Files (Files should be the files a task WRITES). Listing them as Files needlessly couples 4.2 and risks the orchestrator treating any future task touching those files as conflicting with 4.2.",
+            "evidence": "tasks.md L144-146 `4.2 Files: src/main.rs, src/install/launchd.rs, src/install/hooks.rs, src/install/statusline.rs ... Depends: 4.1, 3.2, 3.3 ... Scope: broad`.",
+            "fix": "If 4.2 only orchestrates (calls install/uninstall fns) it should write only src/main.rs (plus maybe a new src/install/mod.rs orchestrator) — trim launchd.rs/hooks.rs/statusline.rs from its Files. If it genuinely edits those modules (e.g. adding an uninstall entrypoint), keep them but that's a smell; better to have 3.2/3.3/4.1 expose complete install+uninstall up front so 4.2 only composes.",
+            "confidence": "low"
+          },
+          {
+            "severity": "nit",
+            "location": "tasks.md 0.1 L13 vs 3.2/3.3 `forward --kind`",
+            "issue": "Task 0.1 wires the `forward` subcommand as a stub but does not mention the `--kind hook|statusline` flag that 3.2/3.3 rely on. A fresh agent on 0.1 may stub `forward` with no args, then 3.1 (which implements `forward`) must add the flag. Since 3.1 Depends transitively on 0.1 and 3.1 owns the implementation, this is harmless, but the flag contract is undocumented at definition time.",
+            "evidence": "tasks.md L13 `subcommands run | install | uninstall | status | doctor | forward`; tasks.md L116,124 `claude-presence forward --kind statusline|hook`.",
+            "fix": "In task 0.1's body, note the `forward` stub should already declare the `--kind <hook|statusline>` arg (per design ADR-9), so 3.1 only fills in the body. One-line addition.",
+            "confidence": "low"
+          }
+        ],
+        "missing_items": [
+          "A task owning the shared error/Result type (thiserror enum) — mandated by CLAUDE.md but no task creates it.",
+          "A task (or explicit step) initializing tracing-subscriber with rotating file logging — FR-8/AC-1 requires rotating logs; 0.1 only adds the dependency.",
+          "A producer task for the shared domain types SessionState/Activity before consumers 1.4/1.5 (currently only created by 2.1 which is downstream).",
+          "Git-remote read for the buttons feature (design §4.3 'buttons from git remote') — referenced by 2.1 but no task implements remote-URL extraction.",
+          "An integration/e2e test exercising the full sessions→transcript→aggregator→sink pipeline (only isolated unit tests exist on 1.1/1.2/5.1).",
+          "FR-3/AC-2 (extract statusLine fields into the model) is mis-traced to 1.1 and not claimed by its real owner 3.1."
+        ],
+        "_label": "R5-task-graph"
+      },
+      {
+        "dimension": "R6 — macOS lifecycle, launchd & reversible install correctness",
+        "verdict": "minor-issues",
+        "summary": "R6 fundamentals are sound and live-verified: bootstrap/bootout is the correct modern launchctl approach (this Mac's launchctl labels load/unload as legacy); the settings.json hooks schema is exactly right vs official docs and the v2.1.181 binary; all chosen hook events incl. SubagentStart/SubagentStop exist in the product; focus=most-recently-active genuinely avoids Accessibility/Screen-Recording prompts (dossier B2); the statusLine cost/context_window/effort fields match the official schema; chaining over the user's real Stop afplay hook is feasible. Issues, none build-blocking: the spec enumerates zero plist keys; KeepAlive vs graceful-shutdown-clears-presence is unresolved (bare KeepAlive:true relaunches after exit-0 and re-sets the cleared presence, breaking FR-8/AC-3 and racing uninstall); design's statusline-wrapper $CC_PRESENCE_INNER env mechanism cannot work (CC injects no such var) and contradicts tasks 3.2; design says load/unload while tasks says bootstrap/bootout.",
+        "findings": [
+          {
+            "severity": "major",
+            "location": "FR-8/AC-3 requirements.md:127 + tasks.md 4.1 line 134 + design ADR-6 / assets/LaunchAgent.plist.tmpl",
+            "issue": "KeepAlive vs graceful-shutdown is unspecified; bare KeepAlive:true is self-defeating. FR-8/AC-3 requires graceful shutdown to clear presence and uninstall to restore exactly. With KeepAlive:true, launchd relaunches the daemon right after exit 0 (which cleared presence), re-setting it within ~1s, and uninstall bootout races the relaunch.",
+            "evidence": "Local man launchd.plist: KeepAlive true 'unconditionally keep the job alive'; SuccessfulExit subkey restarts the job when it exits 0 (true) or only on non-zero (false). The on-machine ~/Library/LaunchAgents/homebrew.mxcl.xcode-discord-rpc.plist uses bare KeepAlive true.",
+            "fix": "Mandate KeepAlive as dict {SuccessfulExit:false} (restart only on crash) in design and tasks 4.1, and require uninstall to launchctl bootout gui/<uid> BEFORE the process exits so it cannot relaunch after presence is cleared. Add an FR-8 AC.",
+            "confidence": "high"
+          },
+          {
+            "severity": "major",
+            "location": "design.md sec3 line 87 LaunchAgent.plist.tmpl + tasks.md 4.1 lines 132-136",
+            "issue": "The spec specifies no plist keys at all. None of Label/ProgramArguments/RunAtLoad/KeepAlive/StandardOutPath/StandardErrorPath/EnvironmentVariables appears anywhere. The whole plist contract is left to the implementer for a lifecycle-critical artifact.",
+            "evidence": "grep over /specs for those keys returns zero hits in any plist context. The on-machine reference plist shows the expected minimal keys: Label, ProgramArguments(absolute), RunAtLoad, KeepAlive, StandardErrorPath, WorkingDirectory.",
+            "fix": "Add a concrete plist key list to design sec3 / tasks 4.1: Label com.<author>.claude-presence, ProgramArguments=[absolute binary path,'run'], RunAtLoad:true, KeepAlive:{SuccessfulExit:false}, StandardOutPath/StandardErrorPath under the log dir, ProcessType:Background.",
+            "confidence": "high"
+          },
+          {
+            "severity": "major",
+            "location": "design.md sec3 line 85 statusline-wrapper reads $CC_PRESENCE_INNER",
+            "issue": "The wrapper mechanism as described cannot work: Claude Code injects no $CC_PRESENCE_INNER (or any custom) env var into the statusLine command, so the wrapper has no inner command to run. It also contradicts tasks 3.2 which says the installer reads and stores the user's current statusLine.command.",
+            "evidence": "Official statusLine docs: the only env vars CC sets for the script are COLUMNS/LINES (v2.1.153+) and FORCE_HYPERLINK; there is no statusLine.env field. The statusLine setting shape is only {type:command,command:<string>} (v2.1.181 binary + live ~/.claude/settings.json).",
+            "fix": "Reword design sec3 line 85 to match tasks 3.2: capture the original statusLine.command and store it in claude-presence state; the installed wrapper embeds the original in the command string it writes, or reads it from a fixed state path. Drop the $CC_PRESENCE_INNER claim.",
+            "confidence": "high"
+          },
+          {
+            "severity": "minor",
+            "location": "design.md sec3 line 79 (load/unload) vs tasks.md 4.1 line 134 (bootstrap/bootout; uninstall unloads)",
+            "issue": "Inconsistent launchctl terminology: design says legacy load/unload, tasks says modern bootstrap/bootout but also 'uninstall unloads'. An implementer reading design alone would use deprecated launchctl load -w/unload.",
+            "evidence": "Live launchctl help: load -> 'Recommended alternatives: bootstrap | enable'; unload -> 'Recommended alternatives: bootout | disable'. Domain target gui/501 confirmed via launchctl print gui/501.",
+            "fix": "Change design.md:79 to bootstrap/bootout gui/<uid>; change tasks 'uninstall unloads' to 'boots out'. Standardize on bootstrap/bootout; note domain target gui/$(id -u).",
+            "confidence": "high"
+          },
+          {
+            "severity": "minor",
+            "location": "platform/macos.rs $TMPDIR sockets / plist EnvironmentVariables premise",
+            "issue": "The premise that the plist must set EnvironmentVariables for $TMPDIR/HOME is false on current macOS: a gui/<uid> LaunchAgent inherits the correct per-user $TMPDIR/$HOME automatically. Hardcoding TMPDIR would be a bug since /var/folders/... is dynamic. Spec should explicitly forbid hardcoding it.",
+            "evidence": "Live: launchd Discord-RPC agent pid 772 (no EnvironmentVariables in plist) has TMPDIR=/var/folders/3y/gmkcmkk1459813sgvwl32q700000gn/T/ and HOME=/Users/jakubsladek (ps eww -p 772); discord-ipc-0 lives in that $TMPDIR.",
+            "fix": "Add a caveat by the plist key list: do not set EnvironmentVariables.TMPDIR; gui/<uid> agents inherit per-user $TMPDIR/$HOME; platform/macos.rs reads runtime env, never a baked-in path.",
+            "confidence": "high"
+          },
+          {
+            "severity": "minor",
+            "location": "requirements.md FR-4/AC-1 line 88 + tasks.md 3.3 line 123 Stop hook chaining",
+            "issue": "Stop does not support a matcher (silently ignored), yet the user's entry is matcher:'' . Chaining must append the forwarder into the existing group's hooks[] and remove only our exact command on uninstall, never keying on matcher equality, or it will drop/duplicate the afplay hook. The spec doesn't flag the matcher-less event class.",
+            "evidence": "Official hooks docs: UserPromptSubmit, PostToolBatch, Stop, TeammateIdle, TaskCreated, TaskCompleted, WorktreeCreate, WorktreeRemove, CwdChanged do not support matchers; a matcher field is silently ignored. Live settings.json hooks.Stop=[{matcher:'',hooks:[{type:command,command:'afplay /System/Library/Sounds/Submarine.aiff'}]}].",
+            "fix": "In tasks 3.3/ADR-4 specify: append our {type:command,command:'claude-presence forward --kind hook'} into the existing group's hooks[] (create if absent); on uninstall remove only our exact command object by identity, never by matcher. Add a fixture test using the real afplay Stop entry.",
+            "confidence": "high"
+          },
+          {
+            "severity": "minor",
+            "location": "requirements.md FR-8/AC-3 line 127 + design ADR-4 line 154 restore-exactly vs post-install edits",
+            "issue": "No rule for the realistic case where the user edits statusLine.command or hooks after install. Naive store-at-install then blind-overwrite-at-uninstall clobbers the user's newer statusline and re-introduces deleted hooks. No drift detection described.",
+            "evidence": "ADR-4 'exact reversible uninstall' and tasks 3.2 'restores the original' do not address post-install edits. The live statusLine.command is a complex multi-line jq+git shell string users keep tweaking.",
+            "fix": "Add an AC: at install record both the original and the exact wrapped value; at uninstall restore the original only if the current value still equals our installed wrapper; if drifted, surgically remove only our segment/hook entry and warn. Same match-and-remove logic for hooks.",
+            "confidence": "medium"
+          }
+        ],
+        "_label": "R6-macos-install-lifecycle"
+      },
+      {
+        "dimension": "R7 — Privacy & security end-to-end (source → Discord)",
+        "verdict": "major-issues",
+        "summary": "The spec has the right privacy *intent* (C-7, NFR-3, ADR-8, FR-7/AC-2: structured-only emit, basename paths, repo blacklist, redaction toggle), and the data model is structured rather than raw-text. But the end-to-end trace exposes real leak vectors the requirements never close. The single biggest one: the Bash activity verb is \"Running command <cmd>\" built from raw tool_input.command, and nothing in any FR/AC strips secrets/tokens from that command before it becomes the PUBLIC `details` field — the only named sanitizers are paths→basename + blacklist. Secondary gaps: ai-title (model-generated topic) is extracted and used with no redaction gate; \"strip secrets\" appears only as an orphaned design comment with no backing AC or test; daemon socket / config / state-dir / log-file permissions are never specified (live dirs are 0755); and verbatim tracing of ingest payloads (which carry the raw command and statusline JSON) is not forbidden. These are public-profile leaks, hence major.",
+        "strengths": [
+          "Privacy is a first-class, explicit cross-cutting concern: C-7, NFR-3, ADR-8, FR-7/AC-2 all state structured-only emit, basename paths, repo/path blacklist, and a redaction toggle; CLAUDE.md calls it 'non-negotiable'.",
+          "The emitted data contract is structured, not free text: PresenceModel (design §4.2) and the ingest events (§4.1) carry typed fields, and §4.1 explicitly labels the statusline event a 'already-sanitized subset of CC's statusline JSON' rather than forwarding it whole.",
+          "Local-only egress is correctly scoped: NFR-3 names the Discord IPC socket as the sole egress; the design adds no network client. Verified the only outbound path is the local discord-ipc-N unix socket.",
+          "A dedicated privacy module (src/privacy.rs) and a dedicated hardening+test task (5.1, with tests/privacy.rs and a global 'private mode' generic card) exist, so there is a place and a gate for the fixes below.",
+          "The research dossier the spec is built on independently flagged the leakage risks (D1 risk #2 'transcripts contain prompt text, file paths, and possibly secrets… never raw prompt content or full file paths'; A3 risk #5; C1 risk #3; D1 'avoid leaking private repo URLs by default') — the spec inherits accurate ground truth."
+        ],
+        "findings": [
+          {
+            "severity": "major",
+            "location": "requirements.md FR-2/AC-2 and FR-7/AC-2; tasks.md 1.4; design.md §4.3 (details row) and §3 privacy.rs comment",
+            "issue": "The Bash activity becomes the PUBLIC `details` string 'Running command <cmd>' built from the raw transcript/hook `tool_input.command`, but NO requirement strips secrets from the command itself. The only sanitizers named anywhere with an AC are 'paths→basename' and 'blacklist' (tasks 1.4: 'Apply privacy sanitizers (paths→basename, blacklist)'). A command like `curl -H \"Authorization: Bearer sk-...\"`, `aws ... --secret ...`, `export GH_TOKEN=...`, or even a private URL/IP would flow verbatim into the card. 'strip secrets' appears ONLY as an unbacked aside in the design module comment (design.md:63 'sanitizers (paths→basename, strip secrets)') — it has no FR/AC, is not in task 1.4's scope line, and task 5.1 only verifies 'no raw prompt/file content' + blacklist, never 'no secret in a Bash command'.",
+            "evidence": "requirements.md:16 headline example `Running command cargo check — private (master)`; requirements.md:58 'Bash→`Running command <cmd>`'; tasks.md:61 same; tasks.md:63 'Apply privacy sanitizers (paths→basename, blacklist)'; design.md:63 lone 'strip secrets'; research-dossier verifications[1].corrected_facts 'The current tool/activity is reconstructable from the last assistant line's tool_use block (.name + input keys)' — i.e. the full command is available and is what feeds details. Live: CLI binary contains `tool_input` (48 hits) confirming the command field is real.",
+            "fix": "Do NOT put the raw command in `details`. Add an AC to FR-2/AC-2 (and a sub-task to tasks 1.4): for Bash, derive a coarse verb from only the program name / first token (e.g. 'Running cargo', 'Running git') and DROP all arguments by default; behind config, optionally show a redacted command that runs a secret-scrubber (strip anything matching token/key/secret/password/Authorization patterns, env-assignments `WORD=...`, URLs with credentials, and long base64/hex blobs) AND truncate. Add a corresponding test in tasks 5.1 asserting a command containing a fake token never appears in `details`.",
+            "confidence": "high"
+          },
+          {
+            "severity": "major",
+            "location": "requirements.md FR-2/AC-3; design.md §3 (transcript.rs derives ai-title) and rp_field_mappings; tasks.md 1.5",
+            "issue": "`ai-title` is extracted (FR-2/AC-3: 'Extract message.model, gitBranch, cwd, and ai-title') but no requirement gates it through redaction or the blacklist, and it is model-generated FROM the user's prompt — i.e. it leaks the work topic. The dossier proposes using it as `large_text`/idle display. A title like 'Analyze Claude rich presence implementation feasibility' (or anything reflecting a confidential project) would render on the public profile.",
+            "evidence": "requirements.md:62 'Extract … and `ai-title`'; research-dossier investigations[0].key_facts: \"ai-title line {type:'ai-title',aiTitle,sessionId} gives a human session title ('Analyze Claude rich presence implementation feasibility')\"; investigations[0].rp_field_mappings notes 'Use ai-title as fallback when idle' and 'large_text = basename(cwd) or ai-title'. Live: CLI binary contains `aiTitle` (22 hits) and `ai-title` (8) — the field is real and populated.",
+            "fix": "Specify whether ai-title is ever shown. Add to FR-7/AC-2 (and tasks 5.1): ai-title is OFF by default; only displayed when a config flag `show_ai_title` is set AND the project is not blacklisted; it must pass the same redaction path as `details`. If FR-2/AC-3 keeps extracting it, add a note that extraction ≠ emission and route it through privacy.rs before it reaches any Discord field.",
+            "confidence": "high"
+          },
+          {
+            "severity": "major",
+            "location": "design.md §3 (logging 'structured logs to file'); requirements.md FR-8/AC-1 ('rotating logs'); CLAUDE.md ('tracing for logs'); tasks.md 0.x/2.3 (logs via tracing)",
+            "issue": "`tracing` writes structured logs to a file, and the ingest path carries the raw `tool_input.command` and the full statusline JSON (paths, cost, model). Nothing in the spec forbids logging these payloads verbatim, and no log-file permission is specified. A debug/info log line that prints the ingest event would persist secrets/prompts/paths to a (potentially 0644) log file — re-introducing the very leak the emit path tries to prevent, just to disk instead of Discord. NFR-3 only governs egress, not local logs.",
+            "evidence": "design.md:49 'structured logs to file'; requirements.md:123 'rotating logs'; design.md §4.1 hook event example contains `\"tool_input\":{\"command\":\"cargo check\"}` and statusline contains cwd — these are exactly the structs that would be `tracing::debug!(?event)`-logged; research-dossier investigations[2].risks 'never surface … only derive counts/status, never display task descriptions verbatim'. No spec line restricts log content or sets log perms.",
+            "fix": "Add an AC under NFR-3 / FR-8: the daemon MUST NOT log raw `tool_input`, raw prompt/transcript text, full paths, or unredacted statusline JSON at any level; only log redacted/structured summaries. Set the log file mode to 0600 and place it under a 0700 state dir. Add a privacy.rs unit test (tasks 5.1) that the log formatter for IngestEvent omits the command/paths.",
+            "confidence": "high"
+          },
+          {
+            "severity": "major",
+            "location": "design.md §4.1 (socket at ~/.local/state/claude-presence/daemon.sock); tasks.md 0.2 (config at ~/.config/claude-presence/config.toml), 3.1 (socket server), 4.1 (launchd/log paths)",
+            "issue": "No permission requirement on the daemon ingest socket, the config file, the state dir, or the log dir. The ingest socket accepts activity-control JSON; if world-writable, any local process could spoof presence (integrity), and if the config/log/state are world-readable they expose blacklist contents and any logged data. Live check shows the parent dirs are NOT private by default: ~/.config and ~/.local/state are drwxr-xr-x (0755). The dossier explicitly raised this (A3 risk #3: 'Several files are 0600/0700 … the app cannot be a shared/root daemon without permission handling').",
+            "evidence": "design.md:93 'Unix socket at ~/.local/state/claude-presence/daemon.sock'; tasks.md:23 '~/.config/claude-presence/config.toml'; research-dossier investigations[2].risks[3] '0600/0700 … permission handling'. Live: `ls -lad ~/.config ~/.local/state` → both `drwxr-xr-x` (0755); contrast ~/.claude/sessions is `drwx------`. So nothing makes our dirs private unless the spec mandates it.",
+            "fix": "Add to FR-7/FR-8: create the state dir 0700 and the config dir 0700; chmod the daemon.sock to 0600 (or 0700) and bind it inside the 0700 state dir; write config.toml and log files 0600; the ingest server SHOULD verify the peer uid == own uid (SO_PEERCRED/getpeereid) and reject others. Reference these in tasks 3.1 (socket) and 4.1 (paths/launchd).",
+            "confidence": "high"
+          },
+          {
+            "severity": "minor",
+            "location": "requirements.md:21 (buttons 'project / about links'); design.md §4.3 buttons row ('from git remote / config') and §3 platform/macos.rs",
+            "issue": "Buttons can leak the full local path and private repo URL. The dossier's mapping is `buttons[0] = file:///Users/jakubsladek/Projects/private` (full home path) and `buttons[1] = <private PR URL>`. The spec sources buttons 'from git remote / config' with no requirement to (a) omit/redact them by default or (b) respect the blacklist. (Separately, Discord requires https:// button URLs, so a `file://` button is also technically invalid — but the privacy point stands regardless.)",
+            "evidence": "requirements.md:21 'optional buttons: project / about links'; design.md:134 'optional; from git remote / config'; research-dossier investigations[1].rp_field_mappings buttons[0] `file:///Users/jakubsladek/Projects/private`, buttons[1] private PR URL; investigations[9].rp_field_mappings notes 'Avoid leaking private repo URLs by default.'",
+            "fix": "Add an AC to FR-7/AC-2: buttons are OFF by default and opt-in per repo; never emit a `file://` path or a private-repo remote URL; when emitted, the URL host/path must pass the blacklist and be https-only. Note in design §4.3 that the git-remote button is suppressed for blacklisted repos and for any non-public remote.",
+            "confidence": "medium"
+          },
+          {
+            "severity": "minor",
+            "location": "requirements.md FR-7/AC-2 + FR-5/AC-3; design.md §4.3 details/state rows",
+            "issue": "cwd/project-slug and branch names are themselves emitted (project + branch are in `details`), and these can be sensitive (e.g. a branch named after an unreleased product or a client). FR-7/AC-2 covers 'blacklisted projects' but the spec does not say the blacklist matches the project NAME/branch (not just the full path), nor that a non-blacklisted-but-still-revealing slug is handled. CLAUDE.md says 'full paths (basename only)', which still emits the project basename and branch verbatim.",
+            "evidence": "design.md:128 details = '{verb} {target} — {project} ({branch})'; requirements.md:118 'repo/path blacklist (blacklisted projects show a generic label or nothing)'; tasks.md 0.2 config key is `blacklist_paths` (paths only). research-dossier investigations[9].risks 'details/state lines … must be sanitized — show project slug + branch … never raw prompt content or full file paths' — acknowledges slug/branch are the chosen surface but assumes the user accepts that.",
+            "fix": "Clarify in FR-7/AC-2 that the blacklist matches on project name, branch, AND path (rename `blacklist_paths`→`blacklist` or add `blacklist_repos`/`blacklist_branches`), and that 'private mode' (tasks 5.1) replaces project+branch with a generic label. Add a test that a blacklisted branch/project never reaches details/state.",
+            "confidence": "medium"
+          },
+          {
+            "severity": "minor",
+            "location": "design.md §4.1 ('statusline event (already-sanitized subset)'); tasks.md 3.2 (statusline-wrapper.sh) and 3.1 (ingest)",
+            "issue": "The design ASSERTS the statusline event is an 'already-sanitized subset', but the sanitization is supposed to happen in the bundled `claude-presence forward` step / wrapper, and no task makes that subsetting/redaction explicit. The raw CC statusline JSON includes `current_dir`, `project_dir`, `original_cwd`, `git_worktree`, `cost`, etc. If the wrapper tees the full JSON to the socket (the natural shell implementation), the 'already-sanitized' claim is false and full paths reach the daemon (and risk being logged).",
+            "evidence": "design.md:104 comment 'already-sanitized subset of CC's statusline JSON'; design.md:85 'statusline-wrapper.sh … tees stdin JSON to the daemon socket'; tasks.md:115 'tees the JSON to claude-presence forward --kind statusline'. Live CLI binary confirms the statusline JSON exposes full paths: strings show `\"current_dir\": \"string\"  // Current working directory path`, `\"project_dir\"`, `\"original_cwd\"`, `\"git_worktree\"`.",
+            "fix": "Make the subsetting a real, located step: specify in tasks 3.1/3.2 that `claude-presence forward --kind statusline` parses CC's JSON and emits ONLY the whitelisted fields (model display_name, effort.level, cost.total_cost_usd, context_window.used_percentage/context_window_size, version) — basename-only for any dir — and never forwards current_dir/project_dir/original_cwd raw. Update the §4.1 comment to point at that code path.",
+            "confidence": "medium"
+          }
+        ],
+        "missing_items": [
+          "A requirement that the Bash (and any tool) command/argument input is secret-scrubbed (token/key/password/Authorization/URL-credential/env-assignment patterns) before it can appear in any public Discord field — currently only paths→basename + blacklist are required.",
+          "A requirement forbidding the daemon from logging raw payloads (tool_input.command, prompt/transcript text, full paths, unredacted statusline JSON) via tracing, plus log-file mode 0600.",
+          "Explicit permission requirements: state dir 0700, config dir 0700, config.toml 0600, daemon.sock 0600 + peer-uid check (SO_PEERCRED/getpeereid) on the ingest socket.",
+          "A policy for ai-title: off by default, redaction-gated, blacklist-aware (currently extracted with no emission gate).",
+          "Buttons privacy policy: opt-in, https-only, no file:// paths, no private-repo URLs, blacklist-aware.",
+          "Clarification that the repo/path blacklist matches project name and branch, not only the absolute path (config key is `blacklist_paths`).",
+          "An explicit, located statusline whitelisting/subsetting step (which fields the forward subcommand keeps) so the design's 'already-sanitized subset' claim is actually enforced and tested."
+        ],
+        "_label": "R7-privacy-security"
+      },
+      {
+        "dimension": "R8 — Internal consistency across requirements.md, design.md, tasks.md, CLAUDE.md",
+        "verdict": "minor-issues",
+        "summary": "The four docs are largely consistent: numbers (128-char caps, 1M/200k context windows, 2.5s/15s intervals, ~5/20s rate limit), the verify gate (cargo fmt/clippy/test), version 2.1.181, hook event names, and all FR-1..9 ACs are cited by at least one task and trace cleanly. Cross-checking against the live CLI bundle confirmed every Anthropic identifier the docs depend on (SessionStart/PreToolUse/PostToolUse/Stop/SubagentStart/SubagentStop, total_cost_usd, used_percentage, context_window_size, display_name, isSidechain, gitBranch, sessionId) actually exists in claude v2.1.181. The defects are localized terminology/coverage mismatches, the most notable being: (1) the `forward` subcommand exists in design ADR-9 and all of tasks but is absent from requirements FR-8/AC-2 even though task 0.1 cites FR-8/AC-2 as its AC; (2) design's architecture diagram names a `collectors::` module that does not exist in the §3 layout or tasks (which use claude/ + ingest/); (3) party.size[0] is described as the running count in one place and the busy count in three others. None are build-blocking, but several would confuse an implementing agent or produce a card that disagrees with the requirements example.",
+        "findings": [
+          {
+            "severity": "major",
+            "location": "requirements.md FR-8/AC-2 (line 124) vs design.md §2 (line 48), §4.1/ADR-9 (lines 97,160), tasks.md 0.1 (line 13) & 3.1 (line 107)",
+            "issue": "The `forward` CLI subcommand is required by design (ADR-9: scripts pipe into `claude-presence forward --kind hook|statusline`) and is wired/implemented across tasks 0.1, 3.1, 3.2, 3.3 — but it is ABSENT from requirements FR-8/AC-2, which enumerates only `run`, `install`, `uninstall`, `status`, `doctor`. design §2's clap row (line 48) also omits `forward`, listing only `run/install/uninstall/status/doctor`. Yet task 0.1 cites `**AC**: FR-8/AC-2` for the skeleton that includes `forward`. So the AC the task points to does not actually authorize the `forward` subcommand.",
+            "evidence": "requirements.md:124 `**AC-2** CLI subcommands: \\`run\\` (foreground), \\`install\\` ... \\`uninstall\\` ... \\`status\\`, \\`doctor\\`` (no forward). design.md:48 `| CLI | \\`clap\\` (derive) | \\`run\\`/\\`install\\`/\\`uninstall\\`/\\`status\\`/\\`doctor\\` |` (no forward). tasks.md:13 `wire \\`clap\\` subcommands \\`run | install | uninstall | status | doctor | forward\\``; tasks.md:16 `- **AC**: FR-8/AC-2`. design.md:97 `scripts pipe their stdin into \\`claude-presence forward --kind hook|statusline\\``.",
+            "fix": "Add `forward` to requirements.md FR-8/AC-2's subcommand list (e.g. \"...`doctor`, and an internal `forward` (used by the chained hook/statusline scripts to pipe events to the daemon socket; not user-facing)\"), and add `forward` to the design.md §2 CLI table row so all three docs agree.",
+            "confidence": "high"
+          },
+          {
+            "severity": "major",
+            "location": "design.md §1 architecture diagram (lines 13-15) vs design.md §3 module layout (lines 64-72) vs tasks.md Files",
+            "issue": "The §1 diagram labels the three input collectors `collectors::sessions`, `collectors::transcript`, `collectors::ingest`, implying a `src/collectors/` module. But the §3 module layout (and every tasks.md Files entry) places these at `src/claude/sessions.rs`, `src/claude/transcript.rs`, and `src/ingest/socket.rs` — there is no `collectors/` directory anywhere. An implementing agent reading the diagram could create the wrong module path.",
+            "evidence": "design.md:13 `collectors::sessions`, design.md:14 `collectors::transcript`, design.md:15 `collectors::ingest`; but design.md:66 `sessions.rs` (under `claude/`), design.md:67 `transcript.rs` (under `claude/`), design.md:71 `socket.rs` (under `ingest/`). `grep -rn 'src/collectors' specs/` returns nothing. tasks.md:56 Files `src/claude/sessions.rs`; tasks.md:75 `src/claude/transcript.rs`; tasks.md:110 `src/ingest/socket.rs`.",
+            "fix": "In design.md §1 relabel the diagram nodes to match the real module paths: `claude::sessions`, `claude::transcript`, `ingest::socket` (or annotate that `collectors::` is a conceptual grouping, not a module path). Keep §3/tasks as the source of truth.",
+            "confidence": "high"
+          },
+          {
+            "severity": "minor",
+            "location": "requirements.md line 19 vs requirements.md FR-5/AC-2 (line 99) vs design.md §4.3 (line 131) vs tasks.md 2.1 (line 81)",
+            "issue": "party.size[0] semantics disagree. Requirements line 19 defines `party.size [current, max]` as \"how many sessions/agents are RUNNING\" with example \"(2 of 5)\" — first element = running/live count. But requirements FR-5/AC-2, design §4.3, and tasks 2.1 all set the first element to the BUSY count (`[busy_count, total_live_count]` / `[busy_count, max|total_count]` / `[busy, total/capacity]`). Running count and busy count are different quantities (e.g. 4 sessions live but 2 busy), so the rendered \"(N of M)\" will not match the line-19 description.",
+            "evidence": "requirements.md:19 `**party.size** \\`[current, max]\\`: how many sessions/agents are running (renders \"(2 of 5)\")`. requirements.md:99 `**AC-2** \\`party.size = [busy_count, total_live_count]\\``. design.md:131 `| \\`party.size\\` | \\`[busy_count, max]\\` or \\`[busy_count, total_count]\\` |`. tasks.md:81 `\\`party.size=[busy,total/capacity]\\``.",
+            "fix": "Reconcile to one definition. Either change requirements.md:19 to `[busy_count, max]` with \"how many sessions are actively working (busy) of capacity\", or change FR-5/AC-2 + design + tasks to use the live/running count as the first element. Recommend the former (busy_count) since three of four docs already use it.",
+            "confidence": "high"
+          },
+          {
+            "severity": "minor",
+            "location": "design.md §3 statusline-wrapper.sh (line 85) vs requirements.md FR-3/AC-1 (lines 71-72) vs tasks.md 3.2 (lines 114-117)",
+            "issue": "The statusline-wrapper's mechanism for obtaining the user's original command is described two incompatible ways. design §3 says the wrapper `reads $CC_PRESENCE_INNER` (an env var that appears in NO other doc). requirements FR-3/AC-1 and tasks 3.2 say the install step `reads the user's current statusLine.command from settings` and `store[s] it` / the wrapper `runs it`. Whether the inner command is injected via `$CC_PRESENCE_INNER` at runtime or baked into the installed wrapper at install time is left contradictory/underspecified.",
+            "evidence": "design.md:85 `statusline-wrapper.sh   reads $CC_PRESENCE_INNER, runs it, tees stdin JSON to the daemon socket`. requirements.md:71-72 `Install a statusline-wrapper that reads the user's current \\`statusLine.command\\` from settings, invokes it ...`. tasks.md:115 `install the wrapper that runs it (stdout passthrough) and tees the JSON`. `grep CC_PRESENCE_INNER` hits only design.md.",
+            "fix": "Pick one mechanism and state it in all three docs. If using `$CC_PRESENCE_INNER`, define it in requirements FR-3/AC-1 and tasks 3.2 (and how install sets it). If baking the stored command into the wrapper at install time, remove the `$CC_PRESENCE_INNER` reference from design.md:85.",
+            "confidence": "medium"
+          },
+          {
+            "severity": "minor",
+            "location": "CLAUDE.md line 14 (Conventions) vs design.md §2 deps table (lines 40-51) vs tasks.md 0.1 dep list (lines 14-15)",
+            "issue": "CLAUDE.md mandates `thiserror` for errors (\"Prefer `thiserror` for errors\"), but `thiserror` is absent from both the design §2 dependency table and the tasks 0.1 explicit dependency list. An agent scaffolding Cargo.toml from task 0.1 would not add it, contradicting the project convention.",
+            "evidence": "CLAUDE.md:14 `Prefer \\`thiserror\\` for errors`. design.md:40-51 deps table (no thiserror row). tasks.md:14-15 `Add deps from design §2 (tokio, notify, sysinfo, libproc, nix, serde, serde_json, discord-rich-presence = \"1.1\", toml, clap, tracing, tracing-subscriber, directories).` (no thiserror). `grep thiserror` hits only CLAUDE.md.",
+            "fix": "Add a `thiserror` row to the design.md §2 table and include `thiserror` in the tasks.md 0.1 dependency list, so the convention is realized in the dependency graph.",
+            "confidence": "high"
+          },
+          {
+            "severity": "minor",
+            "location": "requirements.md line 101 (FR-5/AC-3) vs design.md §5 Truncation (lines 144-145) & §4.3 (line 129)",
+            "issue": "The truncation strategy is described with conflicting priority. Requirements FR-5/AC-3 says \"abbreviate model/plan first, drop least-important metric last\" — i.e. abbreviation (incl. plan) precedes any metric drop. Design §5 says \"drop metrics from the tail (ctx% → tokens → cost → plan) and abbreviate model\" — here metrics are dropped first and the drop ladder INCLUDES `plan` as a droppable metric, while model abbreviation is mentioned but plan abbreviation is not. So requirements treats plan as abbreviate-first; design treats plan as a droppable-last metric.",
+            "evidence": "requirements.md:101 `graceful truncation to ≤128 chars (abbreviate model/plan first, drop least-important metric last)`. design.md:144-145 `if >128, drop metrics from the tail (ctx% → tokens → cost → plan) and abbreviate model (\"Opus 4.8\"→\"O4.8\") until it fits`.",
+            "fix": "Align the algorithm: state a single ordered policy, e.g. \"1) abbreviate model and plan; 2) if still >128, drop metrics tail-first: ctx% → tokens → cost\". Decide whether `plan` is abbreviated (per requirements) or dropped (per design) and make both docs say the same thing.",
+            "confidence": "medium"
+          },
+          {
+            "severity": "nit",
+            "location": "design.md §3 module layout (line 83) & §2 (line 51, tray) vs tasks.md Files",
+            "issue": "Two design features have no owning task / no module-layout slot. (a) design §3 platform/macos.rs lists a `frontmost-app (best-effort)` function, but the only task touching platform/macos.rs (task 1.3) covers exe-filter + lsof cwd fallback only — frontmost-app is never assigned to any task. (b) src/tray.rs (tasks 5.2) is NOT in the design §3 module layout even though §2 and requirements FR-9 cover the tray. Minor orphans, not contradictions.",
+            "evidence": "design.md:83 `platform/macos.rs  $TMPDIR discord sockets, frontmost-app (best-effort), lsof cwd fallback`; tasks.md:50-56 (task 1.3) describes macos.rs as exe-filter + libproc cwd only, no frontmost-app; `grep frontmost tasks.md` = none. tasks.md:160 Files `src/tray.rs`; design §3 layout (lines 60-83) has no tray.rs entry.",
+            "fix": "Either drop `frontmost-app (best-effort)` from design.md:83 (consistent with ADR-7 saying true focus is unobtainable) or add a task line for it. Add `tray.rs   (Phase 5) menu-bar control` to the design §3 module layout for symmetry with tasks 5.2.",
+            "confidence": "medium"
+          },
+          {
+            "severity": "nit",
+            "location": "design.md §4.1 (lines 96-97)",
+            "issue": "Within a single paragraph the subcommand is first named `claude-presence ingest` (as a candidate) and then resolved to `claude-presence forward` by ADR-9. The leftover `ingest` mention could mislead a reader skimming for the subcommand name, since `ingest` is also the module directory name (collision).",
+            "evidence": "design.md:96 `use a bundled \\`claude-presence ingest\\` subcommand the scripts pipe into, or \\`socat\\` if present). Decision`; design.md:97 `(ADR-9): scripts pipe their stdin into \\`claude-presence forward --kind hook|statusline\\``.",
+            "fix": "Reword line 96 to not name a phantom `ingest` subcommand, e.g. \"use a bundled subcommand the scripts pipe into, or `socat` if present)\" — leaving `forward` (line 97) as the only named subcommand.",
+            "confidence": "high"
+          },
+          {
+            "severity": "nit",
+            "location": "tasks.md 0.2 (line 23, config path) vs requirements.md FR-7 / design.md §4.1 (line 93)",
+            "issue": "tasks.md 0.2 pins the config path to `~/.config/claude-presence/config.toml` while the daemon socket/state lives at `~/.local/state/claude-presence/daemon.sock` (design §4.1). The two XDG roots (.config vs .local/state) are individually correct but the split is never stated in requirements or design, and requirements FR-7/AC-1 names no path at all — so the only place the config path appears is one task. Low-risk but an undocumented divergence a reviewer might flag.",
+            "evidence": "tasks.md:23 `Load from \\`~/.config/claude-presence/config.toml\\` with built-in defaults`. design.md:93 `Unix socket at \\`~/.local/state/claude-presence/daemon.sock\\` (configurable)`. requirements.md FR-7 (lines 115-120) names no path.",
+            "fix": "State both well-known paths in one place (design §4.1 or install/paths.rs description): config at `~/.config/claude-presence/config.toml`, state/socket at `~/.local/state/claude-presence/`, so the XDG split is intentional and documented rather than appearing only in a single task.",
+            "confidence": "low"
+          }
+        ],
+        "strengths": [
+          "All FR-1 through FR-9 acceptance criteria are cited by at least one task; the FR/AC traceability between requirements and tasks is complete and accurate (verified by grep: every FR-N/AC-M defined in requirements appears on a task AC line).",
+          "Numeric facts are consistent across all four docs: 128-char caps (requirements C-3 / FR-5/AC-3, design §4.3 & §5, tasks 2.1), 1M vs 200k context windows (requirements FR-3/AC-4, tasks 1.2, CLAUDE.md, design ingest example ctx_size:1000000), 2.5s/15s default intervals (design §5 = requirements' ~2-3s/~15s), and ~5/20s rate limit.",
+          "The verify gate matches exactly between CLAUDE.md line 9 and tasks.md line 3 (`cargo fmt --check` / `cargo clippy -- -D warnings` / `cargo test`).",
+          "Every Anthropic-stable identifier the spec depends on was confirmed to exist in the live CLI binary v2.1.181: all six hook events (incl. the less-common SubagentStart, 28 hits), and the statusLine/transcript fields total_cost_usd, used_percentage, context_window_size, display_name, total_duration_ms, isSidechain, gitBranch, sessionId.",
+          "All 9 ADRs in design map to a requirement/task (ADR-1→FR-3/ADR sources, ADR-2→FR-1/AC-1+task1.3, ADR-3→C-2/FR-5, ADR-4→C-6/tasks3.2-3.3, ADR-5→C-4/task1.1, ADR-6→task2.2, ADR-7→FR-5/AC-1, ADR-8→C-7/task5.1, ADR-9→task0.1+3.1).",
+          "camelCase (Claude's own JSON: sessionId, startedAt, gitBranch) vs snake_case (the project's own ingest JSON and Rust structs: session_id, started_at) is applied consistently and correctly at the data boundary — not an inconsistency.",
+          "The example presence strings agree: requirements' `Opus 4.8 (High) · Max · $0.98 · ... Ctx 8%` matches design's template and ingest example (cost_usd:0.98, ctx_pct:8.3 → 8%), and the cost worked-example numbers in task 1.2 (131/12570/59709/10493) are present in the research-dossier ground truth."
+        ],
+        "missing_items": [
+          "Constraints C-1 (Rust/macOS-only, structure for later portability) and C-5 (no root/no bot token/no OAuth — local Discord IPC only) are never cited on any task's AC line, unlike C-2/C-3/C-4/C-6/C-7. C-5's IPC-only guarantee in particular has no explicit task acceptance hook even though FR-6 tasks implement it.",
+          "NFR-1 (performance/<10ms hook), NFR-2 (reliability/never slow CC), NFR-4 (maintainability/adapter), NFR-5 (portability) are not cited by any task; only NFR-3 and NFR-6 are referenced. The <10ms hook handler requirement (NFR-1, FR-4/AC-3) is cited via FR-4/AC-3 in task 3.3 but NFR-1 itself is untraced.",
+          "A single canonical definition of party.size[0] (running vs busy) — currently the docs carry two contradictory definitions and no doc declares which is authoritative.",
+          "Definition/ownership of the `$CC_PRESENCE_INNER` environment variable — it appears once (design §3) with no spec or task explaining who sets it or whether it is the chosen mechanism over the install-time settings read."
+        ],
+        "_label": "R8-cross-consistency"
+      }
+    ],
+    "synthesis": {
+      "overall_verdict": "needs-major-edits",
+      "headline": "The specs are unusually well-grounded — every Anthropic/Discord identifier (hook events SessionStart/PreToolUse/PostToolUse/Stop/SubagentStart/SubagentStop, statusLine fields total_cost_usd/used_percentage/context_window_size/display_name/total_duration_ms/exceeds_200k_tokens/effort, the 1M-window table, the exe-path filter) is confirmed present in the live v2.1.181 binary, and the chosen crate (discord-rich-presence 1.1.0) really exposes every field the card needs. They are NOT yet 100% buildable. Five issues will produce a wrong or broken build and must be edited first: (1) timestamps.start is documented as epoch SECONDS in design.md but both the pinned crate's own doc-comment and the official Discord docs say MILLISECONDS — a seconds value yields a ~1000x-wrong elapsed timer (the headline Codex-parity field); (2) the inherited code idiom DiscordIpcClient::new(id)? will not compile against 1.1.0 where new() returns Self, not Result; (3) the statusline-wrapper's $CC_PRESENCE_INNER env mechanism is impossible — Claude Code injects no such var (0 hits in the binary; statusLine setting shape is only {type,command}, data arrives on stdin), so the original command must be baked into the wrapper at install time; (4) tasks 2.3 and 3.1 both WRITE src/main.rs with no ordering dependency, so the parallel orchestrator can clobber one writer; (5) party.size is defined four inconsistent ways across the docs and using busy_count as element 0 risks an empty/degenerate counter. After these edits plus the should-fix set (missing plist keys, KeepAlive semantics, type-ownership inversion, secret-scrubbing of Bash commands, log/socket privacy), the specs are ready to build.",
+      "must_fix": [
+        {
+          "location": "design.md §4.3, table row `timestamps.start` (line 130); requirements.md FR-5/AC-4 (line 102) and Product goal `timestamps.start` (line 18)",
+          "issue": "timestamps.start unit is wrong. design.md states 'epoch secs; verified seconds accepted', but the pinned crate's OWN doc-comment (discord-rich-presence-1.1.0/src/activity.rs:60 `/// Unix time (in milliseconds) of when the activity started`) and the official Discord docs (docs.discord.food/resources/presence: 'Unix timestamps (in milliseconds)') both say MILLISECONDS. The dossier's 'seconds accepted' came from a live test that only confirmed Discord ECHOED the value, not that it RENDERED a correct timer — and the dossier itself flags this as confidence:medium with 'confirm the rendered timer is correct, not off by 1000x'. A seconds value parsed as ms places activity start near 1970, producing a grossly wrong elapsed timer.",
+          "concrete_edit": "In design.md §4.3 change the timestamps.start note from 'focused session start (epoch secs; verified seconds accepted)' to 'focused session start, epoch MILLISECONDS (started_at as ms since epoch); Discord renders the elapsed timer from this'. Add the conversion contract: started_at: SystemTime → Timestamps::new().start(dur.as_millis() as i64). In tasks.md 2.2 add an AC: the value handed to the crate is in milliseconds (13 digits for current dates). Remove the false 'verified seconds accepted' clause.",
+          "severity": "blocking",
+          "raised_by": "R2 (verified by me: crate src + official docs both say ms; dossier echo!=render)"
+        },
+        {
+          "location": "tasks.md 2.3 (Files: src/main.rs, Depends: 2.2, line 100) and 3.1 (Files include src/main.rs, Depends: 2.1, line 111)",
+          "issue": "Tasks 2.3 and 3.1 both WRITE src/main.rs but neither depends on the other (paths 2.1→2.2→2.3 and 2.1→3.1 never cross). The executing-plans orchestrator schedules a task the moment its declared Depends complete, so 3.1 becomes ready right after 2.1 — concurrently with the 2.2→2.3 chain. Two tasks editing src/main.rs in the same wave means the second writer clobbers the first's edits.",
+          "concrete_edit": "In tasks.md task 3.1 change `**Depends**: 2.1` to `**Depends**: 2.1, 2.3`. This serializes the two src/main.rs writers (3.1 wires the ingest server boot + `forward` subcommand into the `run` wiring 2.3 established) without adding any false logical dependency.",
+          "severity": "blocking",
+          "raised_by": "R5 (verified against tasks.md Files/Depends lines)"
+        },
+        {
+          "location": "design.md §3 assets block, line 85 (`statusline-wrapper.sh reads $CC_PRESENCE_INNER`); cross-refs requirements.md FR-3/AC-1 (lines 71-74) and tasks.md 3.2 (lines 113-117)",
+          "issue": "The wrapper mechanism as written cannot work and contradicts the other two docs. Claude Code injects NO $CC_PRESENCE_INNER (0 hits in the v2.1.181 binary; the only statusline env vars CC sets are COLUMNS/LINES per v2.1.153+, and session data arrives on stdin). The statusLine setting shape is only {type:command, command:<string>} with no env field — there is no way to inject a custom env var. design.md:85 also conflicts with FR-3/AC-1 and tasks 3.2, which say the installer reads and STORES the user's current statusLine.command.",
+          "concrete_edit": "Reword design.md:85 to match FR-3/AC-1 and tasks 3.2: at install, capture the original statusLine.command and bake it into the installed wrapper script (or read it from a fixed state-dir path); the wrapper execs that stored inner command, passes its stdout through unchanged, and tees the stdin JSON to `claude-presence forward --kind statusline`. Delete every reference to $CC_PRESENCE_INNER (it appears only in design.md).",
+          "severity": "major",
+          "raised_by": "R3, R6, R8 (verified: 0 binary hits for the var; statusline docs confirm stdin-only + {type,command}-only shape)"
+        },
+        {
+          "location": "design.md §2 (discord row, line 46) and §4.3; tasks.md 0.1 (line 15) and 2.2; cross-ref research-dossier C1/C2 sample snippets",
+          "issue": "The dossier's 'verified' Discord snippets use `DiscordIpcClient::new(\"<id>\")?` and were run against discord-rich-presence 0.2, where new() returned Result. In the pinned 1.1.0, new() returns Self (verified: ipc_unix.rs:43 `pub fn new<T: AsRef<str>>(client_id: T) -> Self`), so the `?` will not compile. The public error type is also now discord_rich_presence::error::Error (a thiserror enum), not Box<dyn Error>. An agent copying the dossier idiom verbatim writes non-compiling code.",
+          "concrete_edit": "Add a one-line pitfall note in design.md §2 (discord row) or tasks.md 2.2: 'discord-rich-presence 1.1.0: DiscordIpcClient::new(id) returns Self (no `?`); connect/reconnect/set_activity/clear_activity/close return Result<(), discord_rich_presence::error::Error>; the dossier C1/C2 snippets are 0.2-era and must drop the `?` on new().' Add an AC to tasks.md 2.2 requiring the sink to compile against the pinned 1.1.0.",
+          "severity": "major",
+          "raised_by": "R2, R4 (verified against crate 1.1.0 source on this Mac)"
+        },
+        {
+          "location": "requirements.md Product goal line 19 + FR-5/AC-2 line 99; design.md §4.3 party.size row line 131; tasks.md 2.1 line 81",
+          "issue": "party.size is defined four inconsistent ways: product goal line 19 says element0 = sessions 'running' (live count); FR-5/AC-2 says [busy_count, total_live_count]; design §4.3 says [busy_count, max] OR [busy_count, total_count]; tasks 2.1 says [busy,total/capacity]. The '(2 of 5)' example is non-derivable, and making element0 = busy_count means the counter shows '(0 of N)' or risks disappearing whenever all sessions are idle (no tool mid-run) — the common state. NOTE: the claim that Discord OMITS the party when current=0 is community lore, NOT confirmed in the official docs.discord.food schema (which only documents [current,max] with no zero-handling), so the rationale is 'avoid a degenerate/empty counter', not a documented hard rule.",
+          "concrete_edit": "Pick ONE definition and apply it in all four places. Recommended: `party.size = [live_count, capacity]`, where live_count = total live sessions and capacity = configured max (FR-7/AC-1), defaulting to live_count when capacity is unset. This makes element0 ≥ 1 whenever any session exists and matches the product-goal '(N of M) running' intent. Convey busy/idle via state text or small_image, not party.current. Rewrite requirements.md:19 and FR-5/AC-2:99, collapse design §4.3:131 to the single form, and update tasks.md 2.1:81.",
+          "severity": "major",
+          "raised_by": "R1, R2, R8 (cross-doc contradiction verified; the 'current=0 hides party' mechanism is community-sourced, not in official docs)"
+        }
+      ],
+      "should_fix": [
+        {
+          "location": "design.md §3 (LaunchAgent.plist.tmpl, line 87) and tasks.md 4.1 (lines 132-136)",
+          "issue": "The spec specifies ZERO plist keys for a lifecycle-critical artifact, and leaves KeepAlive vs graceful-shutdown unresolved. Bare KeepAlive=true (per `man launchd.plist`: 'unconditionally keep the job alive') relaunches the daemon right after the exit-0 that cleared the presence, re-setting it within ~1s and racing `uninstall` bootout — directly breaking FR-8/AC-3.",
+          "concrete_edit": "Add a concrete plist key list to design §3 / tasks 4.1: Label com.<author>.claude-presence, ProgramArguments=[<absolute binary path>, 'run'], RunAtLoad=true, KeepAlive={SuccessfulExit:false} (restart only on crash), StandardOutPath/StandardErrorPath under the log dir, ProcessType=Background. Do NOT set EnvironmentVariables.TMPDIR/HOME (gui/<uid> agents inherit per-user values; hardcoding the dynamic /var/folders TMPDIR is a bug). Add an FR-8 AC: uninstall must `launchctl bootout gui/$(id -u)` BEFORE the process exits so it cannot relaunch after clearing presence."
+        },
+        {
+          "location": "tasks.md 1.4 (Files: src/claude/activity.rs) and 1.5 (Files: src/claude/transcript.rs) vs 2.1 (Files: src/state/model.rs); design.md §4.2 lines 111-116",
+          "issue": "SessionState and Activity are defined in src/state/model.rs, owned exclusively by task 2.1. But task 1.4 produces Activity and task 1.5 emits SessionState, and 2.1 Depends on 1.5 — so these shared types have no owning task before their consumers, and a fresh agent on 1.5 cannot compile against a type that doesn't exist yet and isn't in its Files.",
+          "concrete_edit": "Add a new early task `0.3 Core domain types` (Files: src/state/model.rs defining SessionState, Activity, and the PresenceModel skeleton; Depends: 0.1). Add 0.3 to the Depends of tasks 1.4, 1.5, and 2.1, and remove src/state/model.rs from task 2.1's Files (2.1 keeps only src/state/aggregator.rs)."
+        },
+        {
+          "location": "requirements.md FR-2/AC-2 (line 58); tasks.md 1.4 (line 63); design.md §3 privacy.rs (line 63) and §4.3 details row",
+          "issue": "The Bash activity becomes the PUBLIC `details` string 'Running command <cmd>' built from the raw tool_input.command, but the only sanitizers with an AC are paths→basename + blacklist. A command like `curl -H 'Authorization: Bearer sk-...'`, `export GH_TOKEN=...`, or a credentialed URL flows verbatim onto the public profile. 'strip secrets' appears only as an unbacked aside in design.md:63.",
+          "concrete_edit": "Add an AC to FR-2/AC-2 and a sub-step to tasks 1.4: for Bash, by default derive the verb from only the program/first token ('Running cargo', 'Running git') and DROP arguments; behind config, optionally show a scrubbed command (strip token/key/secret/password/Authorization patterns, WORD=value env-assignments, credentialed URLs, and long base64/hex blobs) then truncate. Add a test in tasks 5.1 asserting a command containing a fake token never appears in `details`."
+        },
+        {
+          "location": "requirements.md FR-8 / NFR-3; design.md §3 logging (line 49); tasks.md 3.1, 4.1",
+          "issue": "No permission/log-content requirements: ~/.config and ~/.local/state are 0755 by default (verified live), nothing forbids `tracing::debug!(?event)` writing the raw tool_input.command or full statusline JSON to a (possibly 0644) log file, and the ingest socket has no permission or peer-uid check (any local process could spoof presence).",
+          "concrete_edit": "Add to FR-7/FR-8: create the state and config dirs 0700; write config.toml and log files 0600; bind daemon.sock 0600 inside the 0700 state dir and have the ingest server verify peer uid == own uid (getpeereid). Add an NFR-3/FR-8 AC: the daemon MUST NOT log raw tool_input, prompt/transcript text, full paths, or unredacted statusline JSON at any level — only redacted summaries; apply the same sanitizers used for Discord output to logs. Add a privacy.rs test in tasks 5.1 that the IngestEvent log formatter omits command/paths."
+        },
+        {
+          "location": "requirements.md FR-8/AC-2 (line 124); design.md §2 CLI row (line 48)",
+          "issue": "The `forward` subcommand is required by design ADR-9 and wired in tasks 0.1/3.1/3.2/3.3, but is absent from requirements FR-8/AC-2's subcommand list AND from the design §2 clap row — yet task 0.1 cites FR-8/AC-2 as the AC authorizing it. The AC the task points to doesn't actually list `forward`.",
+          "concrete_edit": "Add `forward` to requirements.md FR-8/AC-2 (e.g. '...`doctor`, and an internal `forward` used by the chained hook/statusline scripts to pipe events to the daemon socket; not user-facing') and to the design.md §2 CLI table row, so all three docs agree."
+        },
+        {
+          "location": "design.md §2 deps table (lines 40-51), §4.3 buttons row (line 134), §7 Risks; requirements.md FR-7/AC-2; tasks.md 0.1 deps line, 5.3",
+          "issue": "Two unaddressed button facts: (a) buttons set over local IPC are NOT visible on your OWN profile (verified via Discord docs/community) — defeating this self-viewing tool's whole point; (b) Discord requires https:// button URLs, yet the dossier's mapping uses buttons[0]=file:///Users/jakubsladek/Projects/private (an invalid URL AND a full-home-path + private-repo-URL privacy leak). Buttons are also not in the classic SET_ACTIVITY schema. Separately, thiserror is mandated by CLAUDE.md but missing from the deps table and tasks 0.1, and notify is unpinned (latest is 9.0.0-rc.4 prerelease; stable is 8.2.0).",
+          "concrete_edit": "Add a §7 risk row noting buttons may not render on the user's own profile via local IPC → keep buttons OFF by default and opt-in per repo, never emit a file:// URL or a private-repo remote URL, and add a doctor note. Annotate the §4.3 buttons row accordingly. Add an FR-7/AC-2 AC for the buttons privacy/https rule. Add a `thiserror` row to design §2 and to tasks 0.1's dep list. Pin notify as `notify = \"8\"` in design §2 and tasks 0.1."
+        },
+        {
+          "location": "tasks.md 3.3 (line 123); requirements.md FR-4/AC-1 (line 89); design ADR-4",
+          "issue": "Stop (and other events) do not support a matcher (silently ignored). The live Stop hook is [{matcher:'', hooks:[{command:'afplay .../Submarine.aiff'}]}]. Chaining must append our forwarder into the existing group's hooks[] and on uninstall remove only our exact command object by identity, never key on matcher equality, or it drops/duplicates the afplay hook. Also: if hooks[<Event>] doesn't exist on a fresh user, install must create it. And no drift rule exists for the realistic case where the user edits statusLine.command or hooks after install (the live statusline is a multi-line jq string users keep tweaking).",
+          "concrete_edit": "In tasks 3.3 / ADR-4 specify: read existing hooks array; if hooks[<Event>] absent, create it; append {type:command, command:'claude-presence forward --kind hook'} into the existing group's hooks[]; on uninstall remove only our exact command object by identity. Add an AC: at install record both the original and the wrapped value; at uninstall restore the original only if the current value still equals our installed wrapper, else surgically remove only our segment/entry and warn. Add a fixture test using the real afplay Stop entry."
+        },
+        {
+          "location": "design.md §1 architecture diagram (lines 13-15) and the notify '$TMPDIR for discord socket creation' note",
+          "issue": "The §1 diagram labels collectors `collectors::sessions/transcript/ingest`, implying a src/collectors/ module that does not exist — §3 and every tasks.md Files entry use src/claude/* and src/ingest/*. Separately, the diagram implies notify watches $TMPDIR for discord-ipc-N socket creation, but the sink design (FR-6/AC-1) just probes ipc-0..9 with backoff; no task implements a $TMPDIR watch, and FSEvents coalescing makes it an unreliable 'Discord started' trigger.",
+          "concrete_edit": "In design.md §1 relabel the diagram nodes to the real module paths (claude::sessions, claude::transcript, ingest::socket) or annotate that collectors:: is a conceptual grouping. Drop the '$TMPDIR for discord socket creation' phrase from the notify description (keep notify scoped to transcript/subagent watching, which is what tasks 1.5 implements)."
+        },
+        {
+          "location": "design.md §2 sysinfo row (line 42) and tasks.md 1.3 (line 53)",
+          "issue": "sysinfo accessors are listed as bare calls (exe()/cwd()/cpu_usage()/start_time()), but on sysinfo 0.30+ (pinned 0.39.3) cwd/exe/cmd are NOT populated by default (verified via docs.rs: they require with_cwd/with_exe(UpdateKind)). An agent doing a default refresh gets cwd()==None for every process and silently falls through to libproc on 100% of sessions.",
+          "concrete_edit": "In design.md §2 and tasks.md 1.3 note the refresh requirement: refresh with ProcessRefreshKind::nothing().with_exe(UpdateKind::Always).with_cwd(UpdateKind::Always).with_cpu() over ProcessesToUpdate::All before reading exe()/cwd(). Also note cpu_usage() needs two refreshes spaced by MINIMUM_CPU_UPDATE_INTERVAL to be non-zero."
+        },
+        {
+          "location": "requirements.md FR-2/AC-3 (line 62); design.md §3 transcript.rs; tasks.md 1.5",
+          "issue": "ai-title is extracted (FR-2/AC-3) and the dossier proposes it for large_text/idle display, but no requirement gates it through redaction or the blacklist. It is model-generated from the user's prompt (e.g. 'Analyze Claude rich presence implementation feasibility') and would render the work topic on the public profile.",
+          "concrete_edit": "Add to FR-7/AC-2 (and tasks 5.1): ai-title is OFF by default; only shown when a config flag is set AND the project is not blacklisted, and must pass the same redaction path as `details`. Add a note that extraction != emission — route ai-title through privacy.rs before any Discord field."
+        },
+        {
+          "location": "tasks.md 1.1 AC list (line 36) vs 3.1 AC list (line 109)",
+          "issue": "Task 1.1 claims FR-3/AC-2 (extract cost/ctx%/model FROM statusLine JSON), but 1.1 only builds the serde struct/parser; the actual extraction-into-the-model is done by task 3.1 (ingest/override), which does NOT list FR-3/AC-2. The extraction AC is traced to a task that doesn't perform it. (Minor — 1.1 legitimately owns the field PARSER.)",
+          "concrete_edit": "Add FR-3/AC-2 to task 3.1's AC list (it performs the extraction/override). Optionally keep it on 1.1 as well if 1.1 owns the parser, so the behavior has a clear owner in both parse and apply stages."
+        },
+        {
+          "location": "requirements.md FR-5/AC-3 (line 101) vs design.md §5 Truncation (lines 144-145)",
+          "issue": "Conflicting truncation priority: FR-5/AC-3 says 'abbreviate model/plan first, drop least-important metric last' (abbreviate, incl. plan, precedes any drop); design §5 says 'drop metrics from the tail (ctx% → tokens → cost → plan) and abbreviate model' (drop first, and treats plan as a droppable metric). plan is abbreviate-first in one, drop-last in the other.",
+          "concrete_edit": "State one ordered algorithm in both: e.g. (1) abbreviate model 'Opus 4.8'→'O4.8'; (2) abbreviate plan; (3) if still >128, drop metrics from the tail ctx% → tokens → cost. Mirror the identical ladder in requirements.md FR-5/AC-3 and design §5."
+        }
+      ],
+      "nice_to_have": [
+        "Add a single-instance guard (FR-8 AC): a launchd agent plus an accidental foreground `claude-presence run` produce two writers to discord-ipc-N, exceeding the 5/20s rate limit and blanking the presence. On startup acquire an exclusive lock (flock on the state dir or socket ownership); if another live instance is detected, exit clearly and have doctor report the conflict.",
+        "Add an empty-state AC (FR-5): when zero live sessions exist, clear the Discord presence (activity:null) and hold cleared until a session appears (configurable: clear vs generic idle card). This also makes FR-5/AC-1 focus selection well-defined for the no-session case.",
+        "Add an explicit Discord-not-running-at-startup AC (extend FR-6/AC-1 or AC-4): if the initial probe of discord-ipc-0..9 finds zero sockets, retry with backoff rather than exiting.",
+        "Replace tilde timing values with concrete defaults already in design (min_interval=2.5s, keepalive=15s) and give the <10ms hook-handler AC a measurement basis + tolerance (e.g. <10ms p95 over 100 invocations, relax to the documented <50ms hook budget if unattainable).",
+        "Add an integration/e2e smoke test task (tests/e2e.rs, Depends 2.3) feeding fixture sessions through the aggregator and asserting a non-empty PresenceModel, since only unit tests exist today.",
+        "Add owning tasks for the thiserror error enum (src/error.rs) and tracing-subscriber init incl. the rotating file appender (src/logging.rs), and make 2.3/4.1 depend on them; also assign git-remote reading (for buttons) to a concrete task/module instead of leaving it implied in design §4.3.",
+        "Standardize launchctl terminology on bootstrap/bootout gui/$(id -u) in both design.md:79 (currently 'load/unload') and tasks.md (currently 'uninstall unloads').",
+        "Note FR-4/AC-1 lists the MVP-minimum hook subset; SessionEnd and CwdChanged exist in the product (confirmed in the binary) and are optional adds for cleanup/project-switching."
+      ],
+      "confirmed_strengths": [
+        "Every Anthropic identifier the specs depend on is confirmed present in the live v2.1.181 binary: hook events SessionStart/PreToolUse/PostToolUse/Stop/SubagentStart/SubagentStop, and statusLine fields total_cost_usd, used_percentage, context_window_size, display_name, total_duration_ms, exceeds_200k_tokens, effort.",
+        "The chosen crate discord-rich-presence 1.1.0 (vionya) genuinely exists, is the latest stable, and its builder exposes every field the card maps (state, details, Timestamps::start(i64), Assets::{large/small_image,_text}, Party::size([i32;2]), Button::new), plus connect/reconnect/set_activity/clear_activity/close — verified in the cached crate source on this Mac.",
+        "The Opus 4.8 = 1M context window (not 200k) decision is correct and consistently applied (CLAUDE.md, FR-3/AC-4, tasks 1.2).",
+        "The exe-path process filter (avoiding pgrep -f truncation), the sessions/<PID>.json + kill(pid,0) liveness model, and focus = most-recently-active (avoiding Accessibility prompts) are all sound and grounded in the dossier.",
+        "The statusLine setting shape and stdin-JSON delivery, the chain-install-never-overwrite principle, the 128-char caps, and the 5/20s rate-limit handling (debounce + coalesce + keepalive) are all accurate vs official docs.",
+        "The declared task Depends graph is acyclic and AC traceability is nearly complete — every task AC reference resolves to a real AC with no orphans (the only defects are the 2.3/3.1 main.rs collision and the type-ownership inversion)."
+      ],
+      "contradictions_or_disagreements": [
+        "party.size element-0 semantics: R1 recommends busy_count as element 0; R2 argues against it (busy=0 risks the counter disappearing) and recommends live/total. My check: the official docs.discord.food schema documents only [current,max] and does NOT confirm 'current=0 omits the party' — that is community lore, not an official rule. The real, verifiable defect is the four-way cross-doc contradiction; I sided with R2's [live_count, capacity] because it resolves the contradiction AND keeps element0 >= 1 whenever sessions exist, matching the product-goal 'running' intent. Flagged the omission rationale as community-sourced in the must_fix.",
+        "R3 mislabeled two findings as 'blocking' that are not: (a) its 'exceeds_200k_tokens nesting' finding self-concludes 'Spec is already correct. No change needed' — a non-finding; verified exceeds_200k_tokens is top-level and the spec treats it correctly. (b) R3's statusline-wrapper finding IS a real major but its proposed CC_PRESENCE_INNER-as-env fix is wrong (CC cannot inject env vars) — the correct fix is baking the stored command into the wrapper, which R6/R8 got right.",
+        "R3's hook-event 'incompleteness' (missing SessionEnd/CwdChanged) is a nit, not a gap: the 6 chosen events all exist and are sufficient for MVP activity tracking. No reviewer treated it as blocking; I kept it nice_to_have.",
+        "R4's 'notify watches $TMPDIR for socket creation' is a doc-narrative inconsistency, not a code issue — no task implements such a watch, so it is should_fix (clean up the diagram), not a build blocker. R4 and R2 both independently and correctly caught the new()-returns-Self compile issue (high agreement)."
+      ],
+      "confidence": "high"
+    }
+  }
+}

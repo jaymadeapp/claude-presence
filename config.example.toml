@@ -1,0 +1,122 @@
+# claude-presence configuration (config.example.toml)
+#
+# Copy this to the load path and edit. The daemon reads:
+#   ~/.config/claude-presence/config.toml
+#
+#   mkdir -p ~/.config/claude-presence
+#   cp config.example.toml ~/.config/claude-presence/config.toml
+#
+# EVERY option is optional and has a built-in default — a missing, empty, or
+# invalid config never crashes the daemon; it logs and falls back to defaults
+# (FR-7/AC-3). The values shown below ARE the defaults. Uncomment a line only to
+# change it. Unknown keys are rejected (deny_unknown_fields), which catches typos.
+#
+# Changes take effect on the next daemon RESTART — there is no hot reload in v1.
+# After editing, restart the agent:
+#   launchctl kickstart -k gui/$(id -u)/com.jakubsladek.claude-presence
+# or simply re-run `claude-presence install`.
+
+# Discord application client id used for the IPC handshake.
+# Default: the registered "CC" app (client_id 1518007333324587168). Override
+# this only if you created your own Discord application (see the README).
+#client_id = 1518007333324587168
+
+# Subscription label shown in the card `state` (e.g. "Max 20x", "Pro").
+# Default: empty (no plan shown). claude-presence cannot auto-detect your plan.
+#plan_label = ""
+
+# Session capacity for `party.size = [live_count, capacity]` (renders "(2 of 5)").
+# Default: unset → capacity tracks the live session count. Set an integer to pin
+# a fixed maximum.
+#capacity = 5
+
+# Minimum seconds between Discord presence updates (debounce floor, FR-6/AC-3).
+# Default: 2.5
+#min_interval = 2.5
+
+# Keep-alive republish cadence in seconds, so the presence does not expire.
+# Default: 15.0
+#keepalive_interval = 15.0
+
+# How recently a subagent must have been active (file mtime) to count as
+# "current", in seconds. Subagents are surfaced separately and NEVER added to
+# party.size.
+# Default: 30
+#subagent_recency_secs = 30
+
+# Show the AI-generated session title. OFF by default for privacy: the title is
+# derived from your prompt, so it is only ever emitted when this is true AND the
+# project is not blacklisted, via the same redaction path as `details`.
+# Default: false
+#show_ai_title = false
+
+# --- Per-field card toggles -------------------------------------------------
+# Which optional fields appear on the card. All on by default except `cost`.
+[fields]
+# Elapsed-time timer (timestamps.start). Default: true
+#timestamp = true
+# Cost in `state`. Default: false — the transcript-only fallback can price only the
+# latest request, not the running session total, so it is hidden unless you opt in
+# (install the statusLine wrapper for an exact figure, then set this true).
+#cost = false
+# Token total in `state`. Default: true
+#tokens = true
+# Context-window percentage in `state`. Default: true
+#context_pct = true
+# Git branch in `details`. Default: true
+#branch = true
+
+# --- Discord art-asset keys -------------------------------------------------
+# Keys of images uploaded in the Discord Developer Portal → Rich Presence → Art
+# Assets. Images are OPTIONAL: leave a key unset (commented out) and that asset
+# is simply omitted — the card still renders a valid presence.
+[assets]
+# Large image (the app picture). Default: unset (omitted).
+#large_image = "cc"
+# Small image badge (the Claude asterisk). Default: unset (omitted).
+#small_image = "claude"
+
+# --- Tool name -> display verb ----------------------------------------------
+# Maps a tool name to the verb shown in `details` (e.g. Bash -> "running cargo").
+# Unlisted tools fall back to the tool name. The defaults below are built in.
+#
+# IMPORTANT: defining this table REPLACES the entire built-in map (it is not
+# merged). To customize, uncomment the [tool_verbs] header AND list every verb
+# you want — re-add the built-in entries you still need. Leaving the header
+# commented keeps the built-in defaults shown below.
+#[tool_verbs]
+#Bash = "running"
+#Read = "reading"
+#Edit = "editing"
+#Write = "writing"
+#Grep = "searching"
+#Glob = "searching"
+#WebSearch = "searching the web"
+#WebFetch = "fetching"
+#Task = "delegating"
+
+# --- Card buttons -----------------------------------------------------------
+# OFF by default (no buttons). The card and its buttons are PUBLIC. When enabled,
+# every URL MUST be https:// (file:// and private/credentialed URLs are rejected
+# downstream). Note: buttons may NOT render on your OWN Discord profile over local
+# IPC — they are visible to other people viewing your profile.
+#
+# Add one [[buttons]] table per button (max 2, label <= 32 chars):
+#[[buttons]]
+#label = "Project repo"
+#url = "https://github.com/you/your-repo"
+
+# --- Privacy ----------------------------------------------------------------
+# Privacy-by-default (C-7, FR-7/AC-2). Only structured, sanitized fields ever
+# leave the process or reach the logs.
+[privacy]
+# Master redaction switch ("private mode"). When true, only generic/sanitized
+# labels are emitted (no targets, no ai-title). Default: true
+#redact = true
+# Absolute project paths whose activity is shown generically or hidden.
+# Default: empty.
+#blacklist_paths = ["/Users/you/private-project"]
+# When true, Bash commands are shown (scrubbed of tokens/keys/secrets/passwords,
+# env-assignments, credentialed URLs, and long base64/hex blobs) instead of being
+# dropped entirely. Default: false (bash args dropped).
+#scrub_bash_args = false

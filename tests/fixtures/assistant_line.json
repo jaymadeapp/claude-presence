@@ -1,0 +1,45 @@
+{
+  "type": "assistant",
+  "cwd": "/Users/redacted/Projects/private",
+  "gitBranch": "master",
+  "sessionId": "d4f690f4-2701-4720-9274-b845c84cb78b",
+  "version": "2.1.181",
+  "timestamp": "2026-06-20T22:35:23.000Z",
+  "uuid": "00000000-0000-0000-0000-000000000001",
+  "parentUuid": "00000000-0000-0000-0000-000000000000",
+  "requestId": "req_redacted",
+  "isSidechain": false,
+  "userType": "external",
+  "entrypoint": "claude-desktop",
+  "slug": "redacted-slug",
+  "message": {
+    "id": "msg_01EvLJredacted",
+    "role": "assistant",
+    "model": "claude-opus-4-8",
+    "stop_reason": "tool_use",
+    "content": [
+      { "type": "text", "text": "REDACTED" },
+      {
+        "type": "tool_use",
+        "id": "toolu_01redacted",
+        "name": "Bash",
+        "input": { "command": "REDACTED", "description": "REDACTED" }
+      }
+    ],
+    "usage": {
+      "input_tokens": 10552,
+      "output_tokens": 1402,
+      "cache_creation_input_tokens": 7021,
+      "cache_read_input_tokens": 19423,
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 10493,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      }
+    }
+  }
+}

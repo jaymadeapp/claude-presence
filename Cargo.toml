@@ -1,0 +1,30 @@
+[package]
+name = "claude-presence"
+version = "0.1.0"
+edition = "2021"
+description = "Rust daemon (macOS) that aggregates live Claude Code activity into a single Discord Rich Presence."
+license = "MIT"
+
+[features]
+# Optional menu-bar tray control (design §3, FR-9). Off by default.
+tray = ["dep:tray-icon", "dep:tao"]
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
+notify = "8"
+sysinfo = "0.39"
+nix = { version = "0.31", features = ["signal", "user"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+discord-rich-presence = "1.1"
+toml = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+directories = "6"
+
+# Tray feature (Phase 5, optional).
+tray-icon = { version = "0.24", optional = true }
+tao = { version = "0.35", optional = true }

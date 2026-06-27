@@ -1,0 +1,24 @@
+{
+  "type": "assistant",
+  "cwd": "/Users/redacted/Projects/private",
+  "gitBranch": "HEAD",
+  "sessionId": "d4f690f4-2701-4720-9274-b845c84cb78b",
+  "version": "2.1.181",
+  "timestamp": "2026-06-20T22:35:24.000Z",
+  "isSidechain": false,
+  "message": {
+    "id": "msg_01EvLJredacted",
+    "role": "assistant",
+    "model": "claude-opus-4-8",
+    "stop_reason": null,
+    "content": [
+      { "type": "text", "text": "RE" }
+    ],
+    "usage": {
+      "input_tokens": 10552,
+      "output_tokens": 1,
+      "cache_creation_input_tokens": 7021,
+      "cache_read_input_tokens": 19423
+    }
+  }
+}

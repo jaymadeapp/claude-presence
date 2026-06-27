@@ -1,0 +1,11 @@
+{
+  "pid": 98863,
+  "sessionId": "d4f690f4-2701-4720-9274-b845c84cb78b",
+  "cwd": "/Users/redacted/Projects/private",
+  "startedAt": 1781987269616,
+  "procStart": "Sat Jun 20 20:27:49 2026",
+  "version": "2.1.181",
+  "peerProtocol": 1,
+  "kind": "interactive",
+  "entrypoint": "claude-desktop"
+}
