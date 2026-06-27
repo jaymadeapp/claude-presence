@@ -27,16 +27,21 @@ That's it — start a Claude Code session and a card appears on your Discord pro
 Prefer to let Claude Code do it? Paste this prompt:
 
 ```text
-Install claude-presence (a Discord Rich Presence for Claude Code) on my Mac:
+Set up claude-presence (a Discord Rich Presence for Claude Code) on my Mac:
 
-1. Run: brew install jaymadeapp/tap/claude-presence
-2. Run: claude-presence install
-   (Run non-interactively it defaults to HIDING the project and the command;
-    add --show-project and/or --show-command if I'd rather show them.)
-3. Make sure the Discord desktop app is running, then run: claude-presence doctor
+1. First ask me these two questions and WAIT for my answers:
+   - "Show your project name on the Discord card, or keep it hidden?"
+   - "Show the command you're currently running, or keep it hidden?"
+2. Run: brew install jaymadeapp/tap/claude-presence
+3. Run `claude-presence install` with -y (so it doesn't prompt again) and the
+   flags matching my answers:
+   - project: shown -> --show-project, hidden -> --hide-project
+   - command: shown -> --show-command, hidden -> --hide-command
+   e.g. for "hide project, show command": claude-presence install -y --hide-project --show-command
+4. Make sure the Discord desktop app is running, then run: claude-presence doctor
    and fix any [FAIL] lines you find.
 
-Report what the doctor output shows when done.
+Report the doctor output when done.
 ```
 
 ## Prerequisites
