@@ -1,4 +1,18 @@
+<div align="center">
+
 # claude-presence
+
+**One Discord Rich Presence card for *all* your Claude Code sessions — live, on macOS.**
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+[![Latest release](https://img.shields.io/github/v/release/jaymadeapp/claude-presence?sort=semver)](https://github.com/jaymadeapp/claude-presence/releases)
+[![Homebrew](https://img.shields.io/badge/Homebrew-jaymadeapp%2Ftap-orange)](https://github.com/jaymadeapp/homebrew-tap)
+[![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey)](#prerequisites)
+[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-ec4899)](https://github.com/sponsors/jaymadeapp)
+
+<img src="docs/card.png" alt="Discord Rich Presence card showing CC / Working across 5 sessions / 5 Agents · Max 20x · 312K tok · Ctx 30% and an elapsed timer, with a Get claude-presence button" width="440">
+
+</div>
 
 A Rust daemon for macOS that merges the live activity of **all** your running
 Claude Code sessions into a **single** Discord Rich Presence card — project,
@@ -9,11 +23,39 @@ Discord allows one presence per application per user, so every session is folded
 into one card (never one card per session); when several sessions are active the
 card shows how many.
 
+> The card shows the bold name **"CC"** — Discord blocked the names "Claude" and
+> "Claude Code" — with **"Claude Code"** appearing as the tooltip when someone
+> hovers the large image.
+
 > **TL;DR** — `brew install jaymadeapp/tap/claude-presence && claude-presence install`.
 > One Discord card for all your Claude Code sessions. No network egress, no bot
 > token (local IPC only). macOS-only, free, MIT. By [jaymade](https://claude-presence.com).
 > Turn it off anytime with `claude-presence disable`; remove it fully with
 > [Uninstall](#uninstall).
+
+## Why claude-presence
+
+Run a handful of Claude Code sessions at once and Discord can only show you *one* —
+or nothing useful at all. claude-presence aggregates every live session into a
+single, honest card: what you're working on, which model, how many agents, how many
+tokens, and a running timer. It does this **without sending anything anywhere** — it
+talks to your local Discord desktop app over its IPC socket, with no bot token, no
+OAuth, and no network egress. Install it in one line, and rip it out cleanly anytime.
+
+## Features
+
+- **Multi-session aggregation** — all your Claude Code sessions folded into one
+  card, with a live count when several run at once.
+- **No network egress** — local Discord IPC only; no bot token, no OAuth, no
+  outbound connection.
+- **Privacy-first** — only structured, sanitized fields ever leave the process;
+  prompts, file contents, full paths, and secrets never do.
+- **One-line install** — `brew install jaymadeapp/tap/claude-presence` pulls a
+  prebuilt binary, no Rust toolchain required.
+- **Security-audited** — `0700`/`0600` state dir, basename-only paths, secret
+  scrubbing on every emitted field.
+- **Reversible install** — chains (never overwrites) your statusLine + hooks, and
+  every install action has a tested, exact uninstall.
 
 ## Quick start
 
@@ -320,3 +362,21 @@ Each check prints `[PASS]`/`[WARN]`/`[FAIL]` with an actionable hint (e.g. "Disc
 not running — start the Discord desktop app", "wrapper not installed — run
 `claude-presence install`"). A common case: no card appears because Discord is not
 running or no Claude Code session is active — both show as `WARN`, not errors.
+
+## Support / Sponsor
+
+claude-presence is free and MIT-licensed, and it'll stay that way. If it earns a
+spot on your Discord profile and you'd like to say thanks, you can
+[sponsor **@jaymadeapp**](https://github.com/sponsors/jaymadeapp) — think
+buy-me-a-coffee for the morale, entirely optional. Stars on the
+[repo](https://github.com/jaymadeapp/claude-presence) and bug reports help just as
+much.
+
+## By jaymade
+
+Built by Jakub ([jaymade](https://claude-presence.com)). More at
+[claude-presence.com](https://claude-presence.com).
+
+## License
+
+MIT — see [LICENSE](./LICENSE).

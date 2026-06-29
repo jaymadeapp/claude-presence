@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="440" height="232" viewBox="0 0 440 232" role="img"
+     aria-label="Discord profile card showing the claude-presence Rich Presence: CC, Working across 5 sessions, 5 Agents, Max 20x, 312 thousand tokens, context 30 percent, 02:14:08 elapsed, with a Get claude-presence button.">
+  <title>claude-presence Discord Rich Presence card — Working across 5 sessions</title>
+  <defs>
+    <linearGradient id="art" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5865F2"/>
+      <stop offset="1" stop-color="#3b45c4"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.35" r="0.85">
+      <stop offset="0" stop-color="#5865F2" stop-opacity="0.20"/>
+      <stop offset="0.72" stop-color="#5865F2" stop-opacity="0"/>
+    </radialGradient>
+    <clipPath id="card-clip"><rect x="20" y="20" width="400" height="192" rx="12"/></clipPath>
+  </defs>
+
+  <!-- ambient glow behind the card -->
+  <rect x="0" y="0" width="440" height="232" fill="url(#glow)"/>
+
+  <!-- card surface (Discord activity surface) -->
+  <rect x="20" y="20" width="400" height="192" rx="12" fill="#1e2128" stroke="#000000" stroke-opacity="0.35"/>
+
+  <g clip-path="url(#card-clip)" font-family="'SF Pro Text','Segoe UI',Helvetica,Arial,sans-serif">
+    <!-- header strip -->
+    <text x="40" y="48" fill="#b5bac1" font-size="11" font-weight="700" letter-spacing="0.6">PLAYING A GAME</text>
+
+    <!-- art tile -->
+    <rect x="40" y="62" width="84" height="84" rx="10" fill="url(#art)"/>
+    <text x="82" y="113" fill="#ffffff" font-size="30" font-weight="800" text-anchor="middle" letter-spacing="1">CC</text>
+
+    <!-- session-count badge on the art tile -->
+    <circle cx="122" cy="146" r="15" fill="#1e2128"/>
+    <circle cx="122" cy="146" r="11" fill="#111318"/>
+    <circle cx="116.5" cy="146" r="3" fill="#3BA55D"/>
+    <text x="124" y="150" fill="#ffffff" font-size="11" font-weight="700" text-anchor="middle">5</text>
+
+    <!-- text lines -->
+    <text x="142" y="78" fill="#f2f3f5" font-size="16" font-weight="700">CC</text>
+    <text x="142" y="101" fill="#dbdee1" font-size="13">Working across 5 sessions</text>
+    <text x="142" y="123" fill="#b5bac1" font-size="11" letter-spacing="-0.2"
+          font-family="'SF Mono','JetBrains Mono',ui-monospace,Menlo,Consolas,monospace">5 Agents · Max 20x · 312K tok · Ctx 30%</text>
+    <circle cx="147" cy="140.5" r="3" fill="#3BA55D"/>
+    <text x="156" y="144" fill="#b5bac1" font-size="11.5"
+          font-family="'SF Mono','JetBrains Mono',ui-monospace,Menlo,Consolas,monospace">02:14:08 elapsed</text>
+
+    <!-- Get claude-presence button -->
+    <rect x="40" y="164" width="360" height="34" rx="8" fill="#4e5058"/>
+    <text x="220" y="186" fill="#ffffff" font-size="13" font-weight="600" text-anchor="middle">Get claude-presence</text>
+  </g>
+</svg>
