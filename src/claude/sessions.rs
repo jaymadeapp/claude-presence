@@ -35,6 +35,7 @@
 //! The public surface is consumed by the transcript collector and aggregator.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use nix::errno::Errno;
 use nix::sys::signal::kill;
@@ -112,6 +113,18 @@ pub fn is_alive(pid: i32) -> bool {
     )
 }
 
+/// Module-owned `sysinfo::System`, reused across discovery ticks (FR-5/AC-1, F16).
+///
+/// Recreating `System` every 3s tick discards the warm CPU baseline and re-does
+/// the kernel enumeration from scratch. We instead hold one instance and
+/// `refresh_*` it in place each call; the `Mutex` makes the shared state safe even
+/// though discovery is single-threaded today. `OnceLock` defers the first
+/// allocation until the first `discover()`.
+fn engine_system() -> &'static Mutex<System> {
+    static SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();
+    SYSTEM.get_or_init(|| Mutex::new(System::new()))
+}
+
 /// Enumerate live engine processes and their resolved cwd (FR-1/AC-1, AC-3).
 ///
 /// Returns `(pid, cwd)` pairs. cwd is taken from `sysinfo` and, if empty, from
@@ -119,8 +132,16 @@ pub fn is_alive(pid: i32) -> bool {
 /// (it cannot be mapped to a transcript). Liveness is *not* filtered here — the
 /// registry pass owns that — but `sysinfo`'s enumeration is inherently of running
 /// processes.
+///
+/// The module-owned [`engine_system`] is refreshed in place rather than recreated
+/// each tick (FR-5/AC-1).
 fn enumerate_engines() -> Vec<(i32, Option<PathBuf>)> {
-    let mut system = System::new();
+    // A poisoned lock would only happen if a prior refresh panicked (it does not);
+    // recover the guard so a single bad tick can never wedge discovery forever.
+    let mut system = match engine_system().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
     // sysinfo gotcha: exe()/cwd() are None unless explicitly requested. cpu is
     // requested too (a later collector corroborates busy/idle with CPU%).
     let refresh = ProcessRefreshKind::nothing()
@@ -240,6 +261,21 @@ fn discover_in(
             debug!(pid, "registry missing sessionId; skipping");
             continue;
         };
+
+        // PID cross-check (FR-5/AC-2, F36): the enumerated/filename PID is the
+        // authoritative live identity (we read `sessions/<pid>.json` for *this*
+        // live engine and confirmed it alive). A registry `pid` field that
+        // disagrees means the file is stale from a prior process that reused this
+        // PID; prefer the enumerated PID so reuse cannot resurrect a dead session.
+        if let Some(reg_pid) = registry.pid {
+            if reg_pid != pid {
+                debug!(
+                    pid,
+                    registry_pid = reg_pid,
+                    "registry pid disagrees with enumerated pid; preferring enumerated (PID reuse)"
+                );
+            }
+        }
 
         let live_cwd = sysinfo_cwd.filter(|c| !c.as_os_str().is_empty());
         let registry_cwd = registry
@@ -544,6 +580,53 @@ mod tests {
         let engines = vec![(dead_pid, Some(PathBuf::from("/tmp"))), (live_no_reg, None)];
         let out = discover_in(&sessions_dir, &projects_dir, engines);
         assert!(out.is_empty());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn discover_in_prefers_enumerated_pid_over_stale_registry_pid() {
+        // PID cross-check (FR-5/AC-2, F36): the registry file is named for the
+        // live, enumerated PID, but its embedded `pid` field is stale (a prior
+        // process that held a different PID wrote it after a reuse). The resolved
+        // session must carry the authoritative *enumerated* PID, never the stale
+        // registry one — otherwise PID reuse could resurrect/mislabel a session.
+        let root = std::env::temp_dir().join(format!("cp-sess-pidx-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let sessions_dir = root.join("sessions");
+        let projects_dir = root.join("projects");
+        fs::create_dir_all(&sessions_dir).unwrap();
+
+        let live_pid = std::process::id() as i32;
+        // A different PID baked into the registry body than the file is named for.
+        let stale_pid = live_pid.wrapping_add(1);
+        assert_ne!(stale_pid, live_pid);
+
+        let cwd = root.join("Projects").join("demo");
+        fs::create_dir_all(&cwd).unwrap();
+        let slug_dir = projects_dir.join(macos::project_slug(&cwd));
+        fs::create_dir_all(&slug_dir).unwrap();
+
+        let session_id = "27c2524d-6f9b-4d16-a833-57f3fdaa68f7";
+        let transcript = touch_jsonl(&slug_dir, session_id);
+
+        // File is `sessions/<live_pid>.json`, but its `pid` field says `stale_pid`.
+        let registry = format!(
+            r#"{{"pid":{stale_pid},"sessionId":"{session_id}","cwd":"{}","startedAt":1781987269616,"version":"2.1.181"}}"#,
+            cwd.display()
+        );
+        fs::write(sessions_dir.join(format!("{live_pid}.json")), registry).unwrap();
+
+        let engines = vec![(live_pid, Some(cwd.clone()))];
+        let out = discover_in(&sessions_dir, &projects_dir, engines);
+
+        assert_eq!(out.len(), 1);
+        let s = &out[0];
+        // Authoritative enumerated PID wins, NOT the stale registry `pid` field.
+        assert_eq!(s.pid, live_pid);
+        assert_ne!(s.pid, stale_pid);
+        assert_eq!(s.session_id, session_id);
+        assert_eq!(s.transcript.as_deref(), Some(transcript.as_path()));
 
         fs::remove_dir_all(&root).unwrap();
     }

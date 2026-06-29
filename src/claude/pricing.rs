@@ -71,16 +71,28 @@ fn table() -> &'static HashMap<String, ModelPricing> {
 /// Look up pricing for a model id.
 ///
 /// Live transcripts carry dated ids (e.g. `claude-haiku-4-5-20251001`), so we
-/// match by longest known-key prefix before falling back to exact lookup.
+/// match by longest known-key prefix before falling back to exact lookup. The
+/// prefix must end on a delimiter boundary — the matched key is followed by `-`
+/// or end-of-string — so `claude-opus-4-50` cannot inherit `claude-opus-4-5`'s
+/// window/price (FR-6/AC-2).
 pub fn pricing(model: &str) -> Option<ModelPricing> {
     let t = table();
     if let Some(p) = t.get(model) {
         return Some(*p);
     }
     t.iter()
-        .filter(|(key, _)| model.starts_with(key.as_str()))
+        .filter(|(key, _)| matches_prefix(model, key.as_str()))
         .max_by_key(|(key, _)| key.len())
         .map(|(_, p)| *p)
+}
+
+/// True when `key` is a delimiter-bounded prefix of `model`: `model` starts with
+/// `key` and the next char (if any) is `-`. Guards against `claude-opus-4-5`
+/// swallowing `claude-opus-4-50`.
+fn matches_prefix(model: &str, key: &str) -> bool {
+    model
+        .strip_prefix(key)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
 }
 
 /// Context window (in tokens) for a model id, falling back to
@@ -203,6 +215,18 @@ mod tests {
             effective_context_window("claude-opus-4-5", Some(0)),
             200_000
         );
+    }
+
+    #[test]
+    fn prefix_match_requires_delimiter_boundary() {
+        // A hypothetical future id must NOT inherit `claude-opus-4-5`'s 200k
+        // window/price just because it shares the textual prefix (FR-6/AC-2).
+        assert!(pricing("claude-opus-4-50").is_none());
+        assert_eq!(context_window("claude-opus-4-50"), DEFAULT_CONTEXT_WINDOW);
+        // Real models (exact + dated) still resolve correctly across the boundary.
+        assert_eq!(context_window("claude-opus-4-8"), 1_000_000);
+        assert_eq!(context_window("claude-opus-4-5"), 200_000);
+        assert_eq!(context_window("claude-opus-4-5-20251001"), 200_000);
     }
 
     #[test]

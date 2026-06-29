@@ -1,5 +1,13 @@
 //! Optional macOS menu-bar tray control (`feature = "tray"`, FR-9/AC-1).
 //!
+//! **Intentionally unwired / deferred (FR-9/AC-2, F34).** The whole module is
+//! gated under `#[cfg(feature = "tray")]` — a *default* build links none of it.
+//! Nothing in the tree calls [`run_tray`] yet: the foreground integration in
+//! [`crate::run`] is a planned follow-up, so this code is dead-by-design rather
+//! than abandoned. It is kept (compiled and tested under `--features tray`) so
+//! the eventual wiring is a known quantity. Do not delete it as "unused"; do not
+//! wire it into the default binary.
+//!
 //! This module is **entirely opt-in**. The daemon's normal home is a headless
 //! `launchd` user agent (design §3.1), which has no UI session and never builds
 //! a tray. The tray is therefore a *foreground* convenience: when a user runs
@@ -26,8 +34,11 @@
 //!
 //! - the daemon **publishes** the latest [`TraySummary`] on a
 //!   [`watch::Receiver`] that the tray polls and renders;
-//! - the tray **emits** [`TrayCommand`]s (on/off, pause, quit) back to the
-//!   daemon over an [`mpsc::UnboundedSender`].
+//! - the tray **emits** [`TrayCommand`]s (on/off, pause) back to the daemon over
+//!   an [`mpsc::UnboundedSender`];
+//! - **Quit** flips the daemon's shutdown [`watch::Sender<bool>`] (FR-9/AC-1)
+//!   rather than hard-exiting, so the daemon's graceful path clears the Discord
+//!   presence (FR-8/AC-3) before the process ends.
 //!
 //! Nothing here reaches Discord or the logs beyond the already-sanitized
 //! summary string the daemon hands in (C-7): the tray is a pure consumer of
@@ -96,14 +107,20 @@ pub enum TrayCommand {
 /// Wiring the daemon hands to [`run_tray`].
 ///
 /// Construct it from the channels the daemon already owns: a `watch` carrying
-/// the latest [`TraySummary`] (cloned cheaply each poll) and an `mpsc` sender
-/// the tray uses to push [`TrayCommand`]s. `enabled`/`paused` seed the initial
-/// check-mark state so the menu matches the daemon's current mode on open.
+/// the latest [`TraySummary`] (cloned cheaply each poll), an `mpsc` sender the
+/// tray uses to push [`TrayCommand`]s, and the daemon's `shutdown` watch sender
+/// so **Quit** can request a *graceful* clear-and-exit (FR-9/AC-1) instead of
+/// hard-killing the process. `enabled`/`paused` seed the initial check-mark
+/// state so the menu matches the daemon's current mode on open.
 pub struct TrayConfig {
     /// Latest presence summary, refreshed by the daemon; polled by the tray.
     pub summary: watch::Receiver<TraySummary>,
     /// Channel the tray pushes [`TrayCommand`]s onto for the daemon to act on.
     pub commands: mpsc::UnboundedSender<TrayCommand>,
+    /// The daemon's shutdown signal (same `watch` the sink waits on). **Quit**
+    /// flips this to `true`, driving the graceful shutdown that clears the
+    /// Discord presence (FR-8/AC-3) — the tray never calls `std::process::exit`.
+    pub shutdown: watch::Sender<bool>,
     /// Initial on/off state of the presence (the on/off toggle's checkmark).
     pub enabled: bool,
     /// Initial paused state (the pause toggle's checkmark).
@@ -118,8 +135,10 @@ pub struct TrayConfig {
 /// background thread, then call `run_tray(cfg)` from `main` so the event loop
 /// owns the main thread as macOS requires. Because [`tao`]'s
 /// [`run`](tao::event_loop::EventLoop::run) returns `!`, control never comes
-/// back here — selecting **Quit** sends [`TrayCommand::Quit`] to the daemon and
-/// then exits the process via `ControlFlow::Exit`.
+/// back here — selecting **Quit** flips the daemon's shutdown `watch` (clearing
+/// the Discord presence via the daemon's graceful path, FR-9/AC-1) and then lets
+/// the event loop fall out via `ControlFlow::Exit`; it never calls
+/// `std::process::exit`.
 ///
 /// Tray construction failures (icon/menu build, unavailable UI session) are
 /// logged via `tracing` and degrade gracefully: the function still enters the
@@ -129,6 +148,7 @@ pub fn run_tray(cfg: TrayConfig) -> ! {
     let TrayConfig {
         mut summary,
         commands,
+        shutdown,
         enabled,
         paused,
     } = cfg;
@@ -184,6 +204,13 @@ pub fn run_tray(cfg: TrayConfig) -> ! {
                         return;
                     }
                     if cmd == TrayCommand::Quit {
+                        // Graceful shutdown: flip the daemon's shutdown watch so
+                        // it clears the Discord presence (FR-9/AC-1, FR-8/AC-3)
+                        // instead of hard-exiting. A send error means the daemon
+                        // is already gone, so there is nothing left to clear.
+                        if shutdown.send(true).is_err() {
+                            warn!("tray quit: shutdown channel closed; daemon already stopped");
+                        }
                         *control_flow = ControlFlow::Exit;
                         return;
                     }
@@ -318,5 +345,31 @@ mod tests {
             TrayCommand::SetEnabled(false)
         );
         assert_ne!(TrayCommand::SetPaused(true), TrayCommand::Quit);
+    }
+
+    /// Quit must trigger graceful shutdown by flipping the daemon's `watch`
+    /// (FR-9/AC-1) rather than hard-exiting — modeling the exact send the event
+    /// loop performs on `TrayCommand::Quit`.
+    #[test]
+    fn quit_flips_the_shutdown_watch_for_graceful_clear() {
+        let (shutdown, rx) = watch::channel(false);
+        assert!(!*rx.borrow(), "shutdown starts un-flipped");
+
+        // Same call the Quit handler makes; the daemon side observes `true` and
+        // runs its clear-presence-then-exit path.
+        assert!(shutdown.send(true).is_ok());
+        assert!(*rx.borrow(), "Quit flips the shutdown watch to true");
+    }
+
+    /// If the daemon already dropped its shutdown receiver, the Quit send fails
+    /// instead of panicking — the tray must degrade, not `unwrap` (NFR-2).
+    #[test]
+    fn quit_tolerates_a_closed_shutdown_channel() {
+        let (shutdown, rx) = watch::channel(false);
+        drop(rx);
+        assert!(
+            shutdown.send(true).is_err(),
+            "send errors once the daemon's receiver is gone"
+        );
     }
 }

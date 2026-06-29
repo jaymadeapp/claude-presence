@@ -81,18 +81,35 @@ fn current_binary() -> Result<PathBuf> {
     Ok(exe.canonicalize().unwrap_or(exe))
 }
 
+/// XML-escape a string before it is substituted into a plist `<string>` element.
+///
+/// Escapes the five predefined XML entities. `&` MUST be escaped first, otherwise
+/// the `&` of a subsequently-inserted entity would itself be re-escaped. A
+/// user-derived install path containing `&`/`<`/`>` would otherwise produce a
+/// malformed plist that `launchctl` refuses to load (FR-3/AC-2, F25).
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 /// Render the plist XML from the resolved binary path, job label, and log paths.
 ///
-/// Pure (no I/O): substitutes the four template placeholders. The result always
-/// carries `RunAtLoad=true`, `KeepAlive={SuccessfulExit:false}`,
-/// `ProcessType=Background`, and `ProgramArguments=[binary, "run"]`, and never
-/// emits `EnvironmentVariables` (design §3.1).
+/// Pure (no I/O): substitutes the four template placeholders. Every user-derived
+/// string (the binary path and the log paths) is XML-escaped via [`xml_escape`]
+/// first, so a path containing `&`/`<`/`>` still yields a well-formed plist
+/// (FR-3/AC-2). The result always carries `RunAtLoad=true`,
+/// `KeepAlive={SuccessfulExit:false}`, `ProcessType=Background`, and
+/// `ProgramArguments=[binary, "run"]`, and never emits `EnvironmentVariables`
+/// (design §3.1).
 pub fn render_plist(binary: &Path, label: &str, stdout: &Path, stderr: &Path) -> String {
     PLIST_TEMPLATE
-        .replace("{{LABEL}}", label)
-        .replace("{{BINARY}}", &binary.to_string_lossy())
-        .replace("{{STDOUT}}", &stdout.to_string_lossy())
-        .replace("{{STDERR}}", &stderr.to_string_lossy())
+        .replace("{{LABEL}}", &xml_escape(label))
+        .replace("{{BINARY}}", &xml_escape(&binary.to_string_lossy()))
+        .replace("{{STDOUT}}", &xml_escape(&stdout.to_string_lossy()))
+        .replace("{{STDERR}}", &xml_escape(&stderr.to_string_lossy()))
 }
 
 /// `gui/<uid>` service-target domain for the current user.
@@ -311,6 +328,38 @@ mod tests {
         ] {
             assert!(p.contains(needle), "missing absolute path: {needle}");
         }
+    }
+
+    #[test]
+    fn plist_xml_escapes_user_derived_paths() {
+        // A binary path with shell/XML metacharacters must appear XML-escaped in the
+        // plist <string> so launchctl loads a well-formed file (FR-3/AC-2, F25).
+        let p = render_plist(
+            Path::new("/Users/a&b/<dir>/claude-presence"),
+            LABEL,
+            Path::new("/home/u/logs/daemon.out.log"),
+            Path::new("/home/u/logs/daemon.err.log"),
+        );
+        // The escaped form is present...
+        assert!(p.contains("<string>/Users/a&amp;b/&lt;dir&gt;/claude-presence</string>"));
+        // ...and no bare `&` from our substitution survives (every `&` is an entity).
+        for frag in p.split('&').skip(1) {
+            assert!(
+                frag.starts_with("amp;")
+                    || frag.starts_with("lt;")
+                    || frag.starts_with("gt;")
+                    || frag.starts_with("quot;")
+                    || frag.starts_with("apos;"),
+                "unescaped `&` in rendered plist near: {frag:.16}"
+            );
+        }
+    }
+
+    #[test]
+    fn xml_escape_handles_ampersand_first() {
+        // `&` must be escaped before `<`/`>` so the inserted entity's own `&` is not
+        // double-escaped.
+        assert_eq!(xml_escape("a&<b>\"'"), "a&amp;&lt;b&gt;&quot;&apos;");
     }
 
     #[test]

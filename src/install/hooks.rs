@@ -28,11 +28,14 @@
 //!
 //! # Identity for remove-by-identity
 //!
-//! Our entry's `command` is the absolute path to the installed forwarder script
-//! (`~/.local/state/claude-presence/hook-forward.sh … forward --kind hook` is
-//! resolved *inside* the script; the settings entry just invokes the script). The
-//! exact command string is the identity uninstall matches on, so a user command
-//! that merely shares a name is never touched.
+//! Our entry's `command` is the absolute path to the installed forwarder script,
+//! **single-quoted** so a path containing a space or shell metacharacter is inert
+//! when Claude Code runs the command through a shell (F23, ADR-3;
+//! `~/.local/state/claude-presence/hook-forward.sh … forward --kind hook` is
+//! resolved *inside* the script; the settings entry just invokes the script). That
+//! exact (quoted) command string is the identity uninstall matches on, so install
+//! and uninstall round-trip on the same form and a user command that merely shares
+//! a name is never touched.
 //!
 //! # Surface (composed by task 4.2)
 //!
@@ -98,10 +101,35 @@ fn current_binary() -> Result<PathBuf> {
 }
 
 /// The exact `command` string our hook entries carry — the identity uninstall
-/// matches on. It is the absolute path to the installed forwarder script; the
+/// matches on. It is the absolute path to the installed forwarder script,
+/// **single-quoted** so a path containing a space or shell metacharacter is inert
+/// when Claude Code runs the command through a shell (F23, ADR-3). The
 /// `forward --kind hook` invocation happens *inside* that script.
+///
+/// Install always writes this quoted form, so it round-trips exactly. Uninstall and
+/// the wiring count, however, also recognize the **legacy bare** unquoted path
+/// ([`installed_script_path`]) that every pre-quoting release (v0.1.0–v0.1.2 + the
+/// Homebrew formula) wrote into all six events — see [`entry_matches_any`] — so an
+/// upgrade-then-uninstall leaves no dangling legacy entry (ADR-3 migration, NFR-4).
+/// A same-named-but-*different* command is still never matched.
 pub fn hook_command(script: &Path) -> String {
-    script.to_string_lossy().into_owned()
+    shell_single_quote(&script.to_string_lossy())
+}
+
+/// Wrap `s` in single quotes, escaping any embedded single quote as `'\''`
+/// (mirrors `statusline::shell_single_quote`).
+fn shell_single_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /// Render the forwarder script from the resolved binary path (pure).
@@ -118,13 +146,20 @@ pub fn render_script(binary: &Path) -> String {
 pub fn wired_count() -> Result<(usize, usize)> {
     let script_path = installed_script_path()?;
     let our_command = hook_command(&script_path);
+    let bare = script_path.to_string_lossy().into_owned();
     let settings = read_settings(&settings_path()?)?;
-    Ok((wired_event_count(&settings, &our_command), EVENTS.len()))
+    Ok((
+        wired_event_count(&settings, &our_command, &bare),
+        EVENTS.len(),
+    ))
 }
 
-/// Pure: count the [`EVENTS`] whose `settings.json` groups contain our exact
-/// command entry (matched by identity in any matcher group of that event).
-fn wired_event_count(settings: &Value, our_command: &str) -> usize {
+/// Pure: count the [`EVENTS`] whose `settings.json` groups contain our entry,
+/// matched by identity in any matcher group of that event. An entry counts when its
+/// `command` equals **either** the current quoted form or the legacy bare path a
+/// pre-quoting install wrote (ADR-3 migration), so `doctor` reports an upgraded but
+/// not-yet-reinstalled install as wired.
+fn wired_event_count(settings: &Value, our_command: &str, bare: &str) -> usize {
     let Some(hooks) = settings.get("hooks").and_then(Value::as_object) else {
         return 0;
     };
@@ -139,7 +174,7 @@ fn wired_event_count(settings: &Value, our_command: &str) -> usize {
                         .iter()
                         .filter_map(|g| g.get("hooks").and_then(Value::as_array))
                         .flatten()
-                        .any(|e| entry_matches(e, our_command))
+                        .any(|e| entry_matches_any(e, our_command, bare))
                 })
         })
         .count()
@@ -159,9 +194,10 @@ pub fn install() -> Result<()> {
     write_script(&script_path, &render_script(&binary))?;
 
     let our_command = hook_command(&script_path);
+    let bare = script_path.to_string_lossy().into_owned();
     let path = settings_path()?;
     let settings = read_settings(&path)?;
-    let updated = apply_install(settings, &our_command);
+    let updated = apply_install(settings, &our_command, &bare);
     write_settings(&path, &updated)?;
     tracing::info!(target: "install", "hooks chained into settings.json");
     Ok(())
@@ -178,10 +214,11 @@ pub fn uninstall() -> Result<()> {
     let script_path = installed_script_path()?;
     let our_command = hook_command(&script_path);
 
+    let bare = script_path.to_string_lossy().into_owned();
     let path = settings_path()?;
     if path.exists() {
         let settings = read_settings(&path)?;
-        let updated = apply_uninstall(settings, &our_command);
+        let updated = apply_uninstall(settings, &our_command, &bare);
         write_settings(&path, &updated)?;
     }
 
@@ -200,33 +237,50 @@ pub fn uninstall() -> Result<()> {
 /// * ensure `settings.hooks` is an object and `settings.hooks[<Event>]` an array
 ///   of matcher groups;
 /// * find (or create) the empty-matcher (`""`) catch-all group;
-/// * append `{ "type": "command", "command": our_command }` into that group's
-///   `hooks[]` **unless an entry with the same command already exists**
-///   (idempotent).
+/// * if the group already carries a **legacy bare** entry (the unquoted path a
+///   pre-quoting install wrote), normalize it in place to the quoted `our_command`
+///   — so an upgrade re-install migrates the bare form rather than appending a
+///   duplicate beside it (ADR-3 migration);
+/// * otherwise append `{ "type": "command", "command": our_command }` into that
+///   group's `hooks[]` **unless an entry with the (quoted or bare) command already
+///   exists** (idempotent).
 ///
-/// All existing user groups and entries are preserved untouched.
-pub fn apply_install(mut settings: Value, our_command: &str) -> Value {
+/// Only the quoted form is ever written. All existing user groups and entries —
+/// including a same-named-but-different command — are preserved untouched.
+pub fn apply_install(mut settings: Value, our_command: &str, bare: &str) -> Value {
     let hooks = ensure_object_at(&mut settings, "hooks");
     for event in EVENTS {
         let groups = ensure_array_at(hooks, event);
         let group = ensure_catch_all_group(groups);
         let entries = ensure_array_at(group, "hooks");
-        if !entries.iter().any(|e| entry_matches(e, our_command)) {
+        if let Some(legacy) = entries
+            .iter_mut()
+            .find(|e| entry_matches(e, bare) && !entry_matches(e, our_command))
+        {
+            // Migrate the legacy bare entry to the quoted identity in place.
+            if let Some(obj) = legacy.as_object_mut() {
+                obj.insert("command".into(), Value::String(our_command.to_owned()));
+            }
+        } else if !entries
+            .iter()
+            .any(|e| entry_matches_any(e, our_command, bare))
+        {
             entries.push(our_entry(our_command));
         }
     }
     settings
 }
 
-/// Pure transform: remove our exact command entry from every event group.
+/// Pure transform: remove our command entry from every event group.
 ///
 /// Scans **all** matcher groups of every event (not just the catch-all, in case a
-/// prior version installed elsewhere) and drops entries whose `command` exactly
-/// equals `our_command`. A group whose `hooks[]` we emptied is removed; an event
-/// whose groups all became empty is removed; an emptied `hooks` map is removed.
-/// User entries — including a same-named-but-different command — are never
-/// touched.
-pub fn apply_uninstall(mut settings: Value, our_command: &str) -> Value {
+/// prior version installed elsewhere) and drops entries whose `command` equals
+/// **either** the current quoted `our_command` or the legacy bare path a pre-quoting
+/// release wrote (ADR-3 migration) — so an upgrade-then-uninstall leaves no dangling
+/// legacy entry. A group whose `hooks[]` we emptied is removed; an event whose groups
+/// all became empty is removed; an emptied `hooks` map is removed. User entries —
+/// including a same-named-but-different command — are never touched.
+pub fn apply_uninstall(mut settings: Value, our_command: &str, bare: &str) -> Value {
     let Some(hooks) = settings.get_mut("hooks").and_then(Value::as_object_mut) else {
         return settings;
     };
@@ -238,7 +292,7 @@ pub fn apply_uninstall(mut settings: Value, our_command: &str) -> Value {
         };
         for group in groups.iter_mut() {
             if let Some(entries) = group.get_mut("hooks").and_then(Value::as_array_mut) {
-                entries.retain(|e| !entry_matches(e, our_command));
+                entries.retain(|e| !entry_matches_any(e, our_command, bare));
             }
         }
         // Drop only groups WE emptied (no remaining entries); never delete a
@@ -267,6 +321,17 @@ fn entry_matches(entry: &Value, our_command: &str) -> bool {
     entry.get("command").and_then(Value::as_str) == Some(our_command)
 }
 
+/// True if `entry`'s `command` equals **either** our current quoted identity
+/// (`quoted`) or the legacy bare unquoted path (`bare`) that a pre-quoting release
+/// wrote. Used so uninstall / the wiring count recognize an upgraded-but-not-yet-
+/// reinstalled install and never leave a dangling legacy entry (ADR-3 migration).
+fn entry_matches_any(entry: &Value, quoted: &str, bare: &str) -> bool {
+    match entry.get("command").and_then(Value::as_str) {
+        Some(cmd) => cmd == quoted || cmd == bare,
+        None => false,
+    }
+}
+
 /// True if a matcher group has no remaining hook entries (so it is safe to drop
 /// when WE were the only entry).
 fn group_is_empty(group: &Value) -> bool {
@@ -278,8 +343,20 @@ fn group_is_empty(group: &Value) -> bool {
 }
 
 /// Ensure `parent[key]` is an object, replacing a non-object, and return it.
+///
+/// Callers always pass an object root (`read_settings` guarantees it), but a degenerate
+/// non-object `parent` is normalized to an empty object **in place** first, so the
+/// `Value::Object` match below is total — there is no runtime panic path (F24).
 fn ensure_object_at<'a>(parent: &'a mut Value, key: &str) -> &'a mut Value {
-    let obj = parent.as_object_mut().expect("settings root is an object");
+    if !parent.is_object() {
+        *parent = json!({});
+    }
+    // `parent` is now an object; matching it directly keeps this total (no `expect`).
+    let Value::Object(obj) = parent else {
+        // Unreachable after the normalization above; normalize once more, no panic.
+        *parent = json!({ key: {} });
+        return &mut parent[key];
+    };
     let slot = obj.entry(key).or_insert_with(|| json!({}));
     if !slot.is_object() {
         *slot = json!({});
@@ -288,13 +365,30 @@ fn ensure_object_at<'a>(parent: &'a mut Value, key: &str) -> &'a mut Value {
 }
 
 /// Ensure `parent[key]` is an array, replacing a non-array, and return it.
+///
+/// `parent` is normalized to an object **in place** first (see [`ensure_object_at`]),
+/// then the key is normalized to an array, so both matches are total — a degenerate
+/// non-object/non-array shape is normalized rather than panicking (F24).
 fn ensure_array_at<'a>(parent: &'a mut Value, key: &str) -> &'a mut Vec<Value> {
-    let obj = parent.as_object_mut().expect("hooks parent is an object");
+    if !parent.is_object() {
+        *parent = json!({});
+    }
+    let Value::Object(obj) = parent else {
+        *parent = json!({ key: [] });
+        let Value::Array(v) = &mut parent[key] else {
+            unreachable!("just inserted an array under key")
+        };
+        return v;
+    };
     let slot = obj.entry(key).or_insert_with(|| json!([]));
     if !slot.is_array() {
         *slot = json!([]);
     }
-    slot.as_array_mut().expect("just ensured array")
+    // `slot` is now an array; matching it directly keeps this total (no `expect`).
+    let Value::Array(v) = slot else {
+        unreachable!("slot normalized to an array above")
+    };
+    v
 }
 
 /// Find the empty-matcher catch-all group, creating it if absent, and return it.
@@ -343,14 +437,19 @@ fn write_settings(path: &Path, settings: &Value) -> Result<()> {
 }
 
 /// Write `contents` to `path` atomically and durably: stream into a sibling
-/// `<name>.json.tmp`, `fsync` it, then `rename` over `path`. The rename is atomic
+/// `<file-name>.tmp`, `fsync` it, then `rename` over `path`. The rename is atomic
 /// within a filesystem, so a crash / power-loss / ENOSPC mid-write can never leave
-/// the user's `settings.json` truncated or half-written (C-6, NFR-6).
+/// the user's `settings.json` truncated or half-written (C-6, F26, NFR-6). The `.tmp`
+/// suffix is *appended* to the full file name (not substituted for the extension) so
+/// it is correct for any target, including an extensionless or non-`.json` path
+/// (mirrors `statusline::write_atomic`).
 fn write_atomic(path: &Path, contents: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("json.tmp");
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
     {
         use std::io::Write;
         let mut f = std::fs::File::create(&tmp)?;
@@ -389,7 +488,12 @@ fn ensure_dir_0700(dir: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
-    const OUR: &str = "/home/u/.local/state/claude-presence/hook-forward.sh";
+    /// The raw, unquoted absolute forwarder-script path.
+    const BARE: &str = "/home/u/.local/state/claude-presence/hook-forward.sh";
+    /// The identity our hook entries actually carry: the bare path wrapped in
+    /// `shell_single_quote` (F23, ADR-3). Install AND uninstall match on this exact
+    /// quoted form, so the round-trip is preserved.
+    const OUR: &str = "'/home/u/.local/state/claude-presence/hook-forward.sh'";
 
     /// The real user Stop entry from the author's settings.json — the fixture the
     /// task requires we preserve byte-for-byte.
@@ -429,7 +533,7 @@ mod tests {
         // The headline acceptance test (FR-4/AC-1, C-6): install must APPEND our
         // entry into the existing Stop group while keeping the user's afplay hook.
         let before = settings_with_afplay_stop();
-        let after = apply_install(before, OUR);
+        let after = apply_install(before, OUR, BARE);
 
         let stop = commands_for(&after, "Stop");
         assert!(
@@ -452,8 +556,8 @@ mod tests {
 
     #[test]
     fn fixture_uninstall_removes_only_ours_keeps_afplay_byte_for_byte() {
-        let installed = apply_install(settings_with_afplay_stop(), OUR);
-        let reverted = apply_uninstall(installed, OUR);
+        let installed = apply_install(settings_with_afplay_stop(), OUR, BARE);
+        let reverted = apply_uninstall(installed, OUR, BARE);
 
         // Our entry is gone; the afplay group survives unchanged.
         let stop = commands_for(&reverted, "Stop");
@@ -474,7 +578,7 @@ mod tests {
     #[test]
     fn install_creates_group_when_event_absent() {
         // SessionStart is not present in the fixture → install creates the group.
-        let after = apply_install(settings_with_afplay_stop(), OUR);
+        let after = apply_install(settings_with_afplay_stop(), OUR, BARE);
         for event in EVENTS {
             let cmds = commands_for(&after, event);
             assert!(
@@ -490,7 +594,7 @@ mod tests {
 
     #[test]
     fn install_from_empty_settings() {
-        let after = apply_install(json!({}), OUR);
+        let after = apply_install(json!({}), OUR, BARE);
         for event in EVENTS {
             assert_eq!(commands_for(&after, event), vec![OUR.to_string()]);
         }
@@ -498,8 +602,8 @@ mod tests {
 
     #[test]
     fn install_is_idempotent() {
-        let once = apply_install(json!({}), OUR);
-        let twice = apply_install(once.clone(), OUR);
+        let once = apply_install(json!({}), OUR, BARE);
+        let twice = apply_install(once.clone(), OUR, BARE);
         assert_eq!(once, twice, "a second install must not add a duplicate");
         for event in EVENTS {
             assert_eq!(
@@ -525,7 +629,7 @@ mod tests {
                 ]
             }
         });
-        let reverted = apply_uninstall(settings, OUR);
+        let reverted = apply_uninstall(settings, OUR, BARE);
         let cmds = commands_for(&reverted, "PreToolUse");
         assert_eq!(
             cmds,
@@ -538,19 +642,19 @@ mod tests {
     fn uninstall_is_idempotent_and_noop_without_our_entry() {
         // No hooks at all → unchanged.
         let plain = json!({ "model": "Opus" });
-        assert_eq!(apply_uninstall(plain.clone(), OUR), plain);
+        assert_eq!(apply_uninstall(plain.clone(), OUR, BARE), plain);
 
         // Only a user entry → untouched, including the empty `hooks` not stripped.
         let user_only = settings_with_afplay_stop();
-        assert_eq!(apply_uninstall(user_only.clone(), OUR), user_only);
+        assert_eq!(apply_uninstall(user_only.clone(), OUR, BARE), user_only);
     }
 
     #[test]
     fn uninstall_drops_groups_and_map_we_created() {
         // Installing into empty settings then uninstalling must return to `{}`
         // for hooks: a group/event/map we created and emptied is removed.
-        let installed = apply_install(json!({ "model": "Opus" }), OUR);
-        let reverted = apply_uninstall(installed, OUR);
+        let installed = apply_install(json!({ "model": "Opus" }), OUR, BARE);
+        let reverted = apply_uninstall(installed, OUR, BARE);
         assert_eq!(
             reverted,
             json!({ "model": "Opus" }),
@@ -561,11 +665,11 @@ mod tests {
     #[test]
     fn wired_event_count_reflects_installed_events() {
         // Nothing installed → zero wired.
-        assert_eq!(wired_event_count(&json!({ "model": "Opus" }), OUR), 0);
+        assert_eq!(wired_event_count(&json!({ "model": "Opus" }), OUR, BARE), 0);
 
         // A full install → all EVENTS wired.
-        let installed = apply_install(json!({}), OUR);
-        assert_eq!(wired_event_count(&installed, OUR), EVENTS.len());
+        let installed = apply_install(json!({}), OUR, BARE);
+        assert_eq!(wired_event_count(&installed, OUR, BARE), EVENTS.len());
 
         // A partial install (our entry in only one event) → exactly one wired,
         // and a user's same-named-but-different command does not count.
@@ -579,7 +683,7 @@ mod tests {
                 ] } ]
             }
         });
-        assert_eq!(wired_event_count(&partial, OUR), 1);
+        assert_eq!(wired_event_count(&partial, OUR, BARE), 1);
     }
 
     #[test]
@@ -593,9 +697,173 @@ mod tests {
     }
 
     #[test]
-    fn hook_command_is_the_script_path() {
-        let cmd = hook_command(Path::new(OUR));
+    fn hook_command_is_the_quoted_script_path() {
+        // The identity is the absolute path single-quoted (F23, ADR-3), so a path
+        // with a space/metacharacter is inert when CC runs it through a shell.
+        let cmd = hook_command(Path::new(BARE));
         assert_eq!(cmd, OUR);
+        assert_eq!(cmd, format!("'{BARE}'"));
+
+        // A path containing a space and a single quote round-trips through the quoting.
+        let spaced = "/Users/a b/state/it's/hook-forward.sh";
+        let quoted = hook_command(Path::new(spaced));
+        assert_eq!(quoted, "'/Users/a b/state/it'\\''s/hook-forward.sh'");
+    }
+
+    #[test]
+    fn install_uninstall_round_trip_on_quoted_identity() {
+        // The headline reversibility guarantee for the QUOTED form (FR-3/AC-1, NFR-4):
+        // install appends the quoted identity, uninstall removes exactly that and
+        // restores the user's afplay group byte-for-byte.
+        let before = settings_with_afplay_stop();
+        let installed = apply_install(before, OUR, BARE);
+
+        // Our entry is present in its quoted form (never a bare path).
+        let stop = commands_for(&installed, "Stop");
+        assert!(stop.contains(&OUR.to_string()), "quoted identity appended");
+        assert!(
+            !stop.contains(&BARE.to_string()),
+            "the bare unquoted path is never written as our entry"
+        );
+
+        let reverted = apply_uninstall(installed, OUR, BARE);
+        assert_eq!(
+            reverted["hooks"]["Stop"],
+            settings_with_afplay_stop()["hooks"]["Stop"],
+            "uninstalling the quoted identity restores the user's group exactly"
+        );
+    }
+
+    #[test]
+    fn upgrade_then_uninstall_cleans_legacy_bare_entries() {
+        // ADR-3 migration / FR-3/AC-1: every pre-quoting release (v0.1.0–v0.1.2 + the
+        // Homebrew formula) wrote the BARE unquoted path into all six events. After a
+        // user UPGRADES and runs uninstall, those legacy entries must be fully cleaned
+        // (no dangling) while a user afplay hook (and any same-named-but-different
+        // command) survives byte-for-byte.
+        let user_command = "/somewhere/else/hook-forward.sh";
+        let legacy = json!({
+            "model": "Opus",
+            "hooks": {
+                "SessionStart": [ { "matcher": "", "hooks": [
+                    { "type": "command", "command": BARE }
+                ] } ],
+                "PreToolUse": [ { "matcher": "", "hooks": [
+                    { "type": "command", "command": BARE }
+                ] } ],
+                "PostToolUse": [ { "matcher": "", "hooks": [
+                    { "type": "command", "command": BARE }
+                ] } ],
+                "Stop": [ { "matcher": "", "hooks": [
+                    afplay_entry(),
+                    { "type": "command", "command": BARE }
+                ] } ],
+                "SubagentStart": [ { "matcher": "", "hooks": [
+                    { "type": "command", "command": BARE }
+                ] } ],
+                "SubagentStop": [ { "matcher": "", "hooks": [
+                    { "type": "command", "command": BARE },
+                    { "type": "command", "command": user_command }
+                ] } ]
+            }
+        });
+
+        let reverted = apply_uninstall(legacy, OUR, BARE);
+
+        // No legacy bare entry survives anywhere.
+        for event in EVENTS {
+            let cmds = commands_for(&reverted, event);
+            assert!(
+                !cmds.contains(&BARE.to_string()),
+                "legacy bare entry must be cleaned from {event}: {cmds:?}"
+            );
+            assert!(
+                !cmds.contains(&OUR.to_string()),
+                "no quoted entry was present to remove in {event}: {cmds:?}"
+            );
+        }
+
+        // The user's afplay Stop hook survives byte-for-byte, in its own group.
+        assert_eq!(
+            commands_for(&reverted, "Stop"),
+            vec!["afplay /System/Library/Sounds/Submarine.aiff"],
+            "the afplay hook must be preserved"
+        );
+        // The same-named-but-different user command survives.
+        assert_eq!(
+            commands_for(&reverted, "SubagentStop"),
+            vec![user_command.to_string()],
+            "a different command must never be removed"
+        );
+    }
+
+    #[test]
+    fn reinstall_over_legacy_bare_is_idempotent_and_normalizes_to_quoted() {
+        // After an UPGRADE, re-running install over the legacy bare entries must
+        // migrate them to the quoted identity in place — never append a duplicate
+        // beside the bare form (ADR-3 migration, idempotent across the upgrade).
+        let legacy = json!({
+            "model": "Opus",
+            "hooks": {
+                "Stop": [ { "matcher": "", "hooks": [
+                    afplay_entry(),
+                    { "type": "command", "command": BARE }
+                ] } ]
+            }
+        });
+
+        let migrated = apply_install(legacy, OUR, BARE);
+        let stop = commands_for(&migrated, "Stop");
+        assert_eq!(
+            stop,
+            vec![
+                "afplay /System/Library/Sounds/Submarine.aiff".to_string(),
+                OUR.to_string()
+            ],
+            "the legacy bare entry is normalized to quoted in place; no duplicate, afplay preserved"
+        );
+        assert!(
+            !stop.contains(&BARE.to_string()),
+            "the bare form must not remain after migration"
+        );
+
+        // Running install AGAIN is a no-op (already quoted) — fully idempotent.
+        let again = apply_install(migrated.clone(), OUR, BARE);
+        assert_eq!(again, migrated, "a second install must not add a duplicate");
+
+        // And uninstall now removes the migrated quoted entry, restoring the user's group.
+        let reverted = apply_uninstall(migrated, OUR, BARE);
+        assert_eq!(
+            commands_for(&reverted, "Stop"),
+            vec!["afplay /System/Library/Sounds/Submarine.aiff"]
+        );
+    }
+
+    #[test]
+    fn apply_install_does_not_panic_on_degenerate_settings() {
+        // F24: callers guarantee an object root via `read_settings`, but apply_install
+        // must NEVER panic even on a degenerate shape — it normalizes instead.
+        // A non-object root.
+        let from_array = apply_install(json!([1, 2, 3]), OUR, BARE);
+        for event in EVENTS {
+            assert_eq!(commands_for(&from_array, event), vec![OUR.to_string()]);
+        }
+
+        // `hooks` present but a non-object (number) — normalized, not panicked.
+        let bad_hooks = apply_install(json!({ "hooks": 42 }), OUR, BARE);
+        for event in EVENTS {
+            assert_eq!(commands_for(&bad_hooks, event), vec![OUR.to_string()]);
+        }
+
+        // An event whose value is a non-array (string), and a group whose `hooks`
+        // is a non-array — both normalized in place without panic.
+        let bad_event = apply_install(
+            json!({ "hooks": { "Stop": "nope", "PreToolUse": [ { "matcher": "", "hooks": 7 } ] } }),
+            OUR,
+            BARE,
+        );
+        assert!(commands_for(&bad_event, "Stop").contains(&OUR.to_string()));
+        assert!(commands_for(&bad_event, "PreToolUse").contains(&OUR.to_string()));
     }
 
     #[test]

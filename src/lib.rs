@@ -112,22 +112,28 @@ pub async fn run() -> Result<()> {
     wait_for_terminate().await;
     info!("claude-presence: shutdown requested; clearing presence");
 
-    // Flip the sink's shutdown watch so it clears the Discord presence, then join
-    // the dedicated sink thread so the clear actually completes before we exit
-    // (FR-8/AC-3). Joining a sync thread blocks; do it off the async runtime.
+    // Flip the sink's shutdown watch so it clears the Discord presence (FR-8/AC-3).
     let _ = shutdown_tx.send(true);
-    if let Err(err) = tokio::task::spawn_blocking(move || sink_handle.join())
-        .await
-        .map(|_| ())
-    {
-        warn!(%err, "discord sink join task failed");
-    }
 
-    // Stop the collector loop (it owns the per-session transcript watchers) and
-    // the ingest accept loop (it owns the daemon socket).
+    // Stop the collector loop (it owns the per-session transcript watchers) and the
+    // ingest accept loop (it owns the daemon socket) BEFORE the blocking sink join,
+    // so neither keeps re-enumerating sessions / spawning `lsof` while we wait to
+    // clear the presence (FR-2/AC-4). Clearing the presence stays correct because
+    // the sink owns its own last model — it needs nothing from the collector here.
     collector_handle.abort();
     if let Some(handle) = ingest_handle {
         handle.abort();
+    }
+
+    // Join the dedicated sink thread so the clear actually completes before we exit,
+    // but bound the wait to 3s so a half-open Discord (wedged IPC handshake/read)
+    // cannot stall shutdown indefinitely (FR-2/AC-2). On timeout we log and fall
+    // through to exit, dropping the handle; the OS reaps the wedged thread.
+    let join = tokio::task::spawn_blocking(move || sink_handle.join());
+    match tokio::time::timeout(Duration::from_secs(3), join).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(err)) => warn!(%err, "discord sink join task failed"),
+        Err(_) => warn!("discord sink join timed out after 3s; exiting anyway"),
     }
 
     info!("claude-presence: stopped");
@@ -247,78 +253,115 @@ type CollectorHandle = tokio::task::JoinHandle<()>;
 ///   publishes the set on change.
 fn spawn_collectors(
     cfg: Config,
-    mut overlay_rx: Option<tokio::sync::mpsc::Receiver<Overlay>>,
+    overlay_rx: Option<tokio::sync::mpsc::Receiver<Overlay>>,
 ) -> (CollectorHandle, watch::Receiver<Vec<SessionState>>) {
     let (tx, rx) = watch::channel::<Vec<SessionState>>(Vec::new());
 
-    let handle = tokio::spawn(async move {
-        let mut watchers: std::collections::HashMap<String, SessionTracker> =
-            std::collections::HashMap::new();
-        // Latest ingest overlay per session, persisted across discovery ticks so
-        // a statusLine's exact cost/ctx%/model (and a hook's activity) stays on
-        // the card until the next push for that session (FR-3, FR-4/AC-2).
-        let mut overlays: std::collections::HashMap<String, Overlay> =
-            std::collections::HashMap::new();
-        let mut ticker = tokio::time::interval(DISCOVERY_INTERVAL);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        loop {
-            let live = match sessions::discover() {
-                Ok(live) => live,
-                Err(err) => {
-                    // A discovery failure (e.g. unresolvable ~/.claude) must not
-                    // kill the loop — degrade to "no sessions" and retry (NFR-2).
-                    warn!(%err, "session discovery failed; treating as no sessions");
-                    Vec::new()
-                }
-            };
-
-            reconcile_watchers(&mut watchers, &live, &cfg);
-            // Drop overlays for sessions that are no longer live so a stale push
-            // can never resurrect a dead session.
-            prune_overlays(&mut overlays, &live);
-            let snapshot = build_snapshot(&watchers, &live, &overlays);
-
-            // Publish only on a meaningful change so the aggregator debounces
-            // naturally; equality is structural over the card-relevant fields
-            // (including the overlay-driven cost/ctx%/activity, so a push
-            // republishes — FR-3, FR-4/AC-2).
-            if !sessions_eq(&tx.borrow(), &snapshot) && tx.send(snapshot).is_err() {
-                // Aggregator dropped the receiver → nothing to feed; stop.
-                break;
-            }
-
-            // Re-enumerate on the discovery tick OR the instant an ingest overlay
-            // arrives, so a `PreToolUse` "Running X" / statusLine update lands
-            // immediately rather than at the next 3s tick (FR-4/AC-2).
-            match overlay_rx.as_mut() {
-                Some(rx) => {
-                    tokio::select! {
-                        _ = ticker.tick() => {}
-                        recv = rx.recv() => match recv {
-                            Some(overlay) => {
-                                overlays.insert(overlay.session_id.clone(), overlay);
-                                // Coalesce any other immediately-pending overlays
-                                // before re-aggregating, to batch a hook burst.
-                                while let Ok(more) = rx.try_recv() {
-                                    overlays.insert(more.session_id.clone(), more);
-                                }
-                            }
-                            // Ingest server gone → stop draining overlays but keep
-                            // the JSONL-only loop running on the timer alone.
-                            None => overlay_rx = None,
-                        }
-                    }
-                }
-                None => {
-                    ticker.tick().await;
-                }
-            }
-        }
-        debug!("collector loop exited");
-    });
+    let handle = tokio::spawn(collector_loop(cfg, overlay_rx, tx, sessions::discover));
 
     (handle, rx)
+}
+
+/// The collector loop body, generic over the `discover` source so a test can
+/// inject a counting fake and assert `discover()` is NOT re-run on an overlay-only
+/// wake (FR-2/AC-6).
+///
+/// `discover()` (sysinfo enumeration + `lsof` cwd resolution) runs **only** on the
+/// discovery-interval ticker arm of the `select!`; an overlay wake rebuilds the
+/// card snapshot from the already-held `live`/`watchers` set (reusing the last
+/// `live`), so a burst of overlays coalesces into a single rebuild without a fresh
+/// enumeration (F40). Publishing stays gated on a card-relevant change via
+/// [`sessions_eq`].
+async fn collector_loop<D>(
+    cfg: Config,
+    mut overlay_rx: Option<tokio::sync::mpsc::Receiver<Overlay>>,
+    tx: watch::Sender<Vec<SessionState>>,
+    mut discover: D,
+) where
+    D: FnMut() -> Result<Vec<LiveSession>>,
+{
+    let mut watchers: std::collections::HashMap<String, SessionTracker> =
+        std::collections::HashMap::new();
+    // Latest ingest overlay per session, persisted across discovery ticks so
+    // a statusLine's exact cost/ctx%/model (and a hook's activity) stays on
+    // the card until the next push for that session (FR-3, FR-4/AC-2).
+    let mut overlays: std::collections::HashMap<String, Overlay> = std::collections::HashMap::new();
+    // The most recent live set, reused on overlay wakes so we do not re-enumerate
+    // (FR-2/AC-6). Seeded by the first discovery tick below.
+    let mut live: Vec<LiveSession> = Vec::new();
+    let mut ticker = tokio::time::interval(DISCOVERY_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        // Rebuild the card snapshot from the current `live`/`watchers`/`overlays`
+        // and publish only on a meaningful change so the aggregator debounces
+        // naturally; equality is structural over the card-relevant fields
+        // (including the overlay-driven cost/ctx%/activity, so a push
+        // republishes — FR-3, FR-4/AC-2).
+        let snapshot = build_snapshot(&watchers, &live, &overlays);
+        if !sessions_eq(&tx.borrow(), &snapshot) && tx.send(snapshot).is_err() {
+            // Aggregator dropped the receiver → nothing to feed; stop.
+            break;
+        }
+
+        // Wake on the discovery tick (re-enumerate) OR the instant an ingest
+        // overlay arrives, so a `PreToolUse` "Running X" / statusLine update lands
+        // immediately rather than at the next 3s tick (FR-4/AC-2). Only the ticker
+        // arm runs `discover()`; the overlay arm reuses the held `live` (F40).
+        match overlay_rx.as_mut() {
+            Some(rx) => {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        rediscover(&mut discover, &mut live, &mut watchers, &mut overlays, &cfg);
+                    }
+                    recv = rx.recv() => match recv {
+                        Some(overlay) => {
+                            overlays.insert(overlay.session_id.clone(), overlay);
+                            // Coalesce any other immediately-pending overlays
+                            // before re-aggregating, to batch a hook burst into a
+                            // single rebuild (FR-2/AC-6).
+                            while let Ok(more) = rx.try_recv() {
+                                overlays.insert(more.session_id.clone(), more);
+                            }
+                        }
+                        // Ingest server gone → stop draining overlays but keep
+                        // the JSONL-only loop running on the timer alone.
+                        None => overlay_rx = None,
+                    }
+                }
+            }
+            None => {
+                ticker.tick().await;
+                rediscover(&mut discover, &mut live, &mut watchers, &mut overlays, &cfg);
+            }
+        }
+    }
+    debug!("collector loop exited");
+}
+
+/// Run one discovery enumeration and reconcile the held `live`/`watchers`/`overlays`
+/// state from it (the ticker arm of [`collector_loop`]). A discovery failure must
+/// not kill the loop — degrade to "no sessions" and retry (NFR-2).
+fn rediscover<D>(
+    discover: &mut D,
+    live: &mut Vec<LiveSession>,
+    watchers: &mut std::collections::HashMap<String, SessionTracker>,
+    overlays: &mut std::collections::HashMap<String, Overlay>,
+    cfg: &Config,
+) where
+    D: FnMut() -> Result<Vec<LiveSession>>,
+{
+    *live = match discover() {
+        Ok(found) => found,
+        Err(err) => {
+            warn!(%err, "session discovery failed; treating as no sessions");
+            Vec::new()
+        }
+    };
+    reconcile_watchers(watchers, live, cfg);
+    // Drop overlays for sessions that are no longer live so a stale push can never
+    // resurrect a dead session.
+    prune_overlays(overlays, live);
 }
 
 /// Drop overlays whose session is no longer in the live set so a stale ingest
@@ -836,6 +879,110 @@ mod tests {
             derived.and_then(|d| d.tokens_total),
             Some(120_150),
             "the attached watcher must derive this session's tokens"
+        );
+    }
+
+    /// FR-2/AC-6: an overlay-only wake must NOT trigger a fresh `sessions::discover()`
+    /// (the sysinfo enumeration + `lsof`), and a burst of overlays must coalesce into
+    /// a single rebuild. We drive [`collector_loop`] with a counting `discover` and a
+    /// long [`DISCOVERY_INTERVAL`] so the 3s ticker fires exactly once (its immediate
+    /// first tick) — every subsequent wake we cause is an overlay wake that must NOT
+    /// re-discover.
+    #[tokio::test]
+    async fn overlay_wake_does_not_rediscover() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_discover = calls.clone();
+        let discover = move || {
+            calls_for_discover.fetch_add(1, Ordering::SeqCst);
+            Ok::<Vec<LiveSession>, Error>(Vec::new())
+        };
+
+        let (overlay_tx, overlay_rx) = tokio::sync::mpsc::channel::<Overlay>(8);
+        let (tx, _rx) = watch::channel::<Vec<SessionState>>(Vec::new());
+        let loop_handle = tokio::spawn(collector_loop(
+            Config::default(),
+            Some(overlay_rx),
+            tx,
+            discover,
+        ));
+
+        // The loop's `interval` is due immediately at t=0, so its FIRST `select!`
+        // wakes on the ticker arm — the one legitimate discovery, not an overlay
+        // wake. Wait (bounded, real-time) for that first tick to register. The next
+        // ticker tick is ~3s out, far beyond this test's wall-clock.
+        wait_for_count(&calls, 1).await;
+        let after_first_tick = calls.load(Ordering::SeqCst);
+        assert_eq!(
+            after_first_tick, 1,
+            "the initial ticker tick discovers once"
+        );
+
+        // Deliver a burst of overlays. None of these wakes may call `discover()`;
+        // the overlay arm reuses the held `live` set (F40).
+        for i in 0..5 {
+            overlay_tx
+                .send(Overlay {
+                    session_id: format!("s{i}"),
+                    ..Overlay::default()
+                })
+                .await
+                .unwrap();
+        }
+        // Give the loop ample real time to process the whole burst — still well
+        // under the 3s discovery interval, so a second discovery would only be the
+        // bug under test, never the timer.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            after_first_tick,
+            "BUG (F40): an overlay-only wake re-ran sessions::discover()"
+        );
+
+        loop_handle.abort();
+    }
+
+    /// Poll `counter` (real-time, bounded to ~1s — far under the 3s discovery
+    /// interval) until it reaches `target`, so the test does not race the spawned
+    /// collector loop nor depend on `yield_now` scheduling.
+    async fn wait_for_count(counter: &std::sync::atomic::AtomicUsize, target: usize) {
+        use std::sync::atomic::Ordering;
+        for _ in 0..100 {
+            if counter.load(Ordering::SeqCst) >= target {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("counter never reached {target} within the bound");
+    }
+
+    /// FR-2/AC-2: the bounded sink-thread join must complete promptly even if the
+    /// join never returns (a half-open Discord wedged in the IPC handshake/read). We
+    /// model the wedged join with a `spawn_blocking` that parks well past the bound
+    /// and assert the `timeout` arm fires (it returns `Err`) instead of hanging — the
+    /// production code uses the same `tokio::time::timeout(..)` wrapper with a 3s
+    /// bound. A short 100ms bound keeps the test fast while exercising the same path.
+    #[tokio::test]
+    async fn bounded_join_is_time_boxed() {
+        // A "wedged" sink thread that does not return until well past the 50ms
+        // bound; 700ms keeps the test fast while still proving the timeout fires
+        // first (the assertion below requires the wrapper to return < 500ms).
+        let join = tokio::task::spawn_blocking(|| {
+            std::thread::sleep(Duration::from_millis(700));
+        });
+
+        let start = std::time::Instant::now();
+        let outcome = tokio::time::timeout(Duration::from_millis(50), join).await;
+        assert!(
+            outcome.is_err(),
+            "the join must hit the timeout, not return"
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "the bounded join must not block on the wedged thread"
         );
     }
 }

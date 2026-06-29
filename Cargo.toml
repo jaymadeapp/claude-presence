@@ -9,6 +9,34 @@ license = "MIT"
 # Optional menu-bar tray control (design §3, FR-9). Off by default.
 tray = ["dep:tray-icon", "dep:tao"]
 
+# ---------------------------------------------------------------------------
+# Supply-chain advisory disposition (FR-10 / AC-1; design §J; findings F14/F35)
+#
+# `cargo audit` reports 0 vulnerabilities and 11 unmaintained/unsound *warnings*
+# for the workspace. Every one of those warnings is reachable ONLY through the
+# optional, off-by-default `tray` feature (`tray-icon` + `tao` above). The
+# DEFAULT build pulls NONE of these crates — verified via `cargo tree` (no GTK/
+# `proc-macro-error` crate appears without `--features tray`); recorded run in
+# `specs/hardening/verification.md`.
+#
+# Tray-only (reachable only via `--features tray`, through `tao`/`tray-icon`):
+#   - GTK3 gtk-rs bindings, no longer maintained (RUSTSEC-2024-0411..0416,
+#     0418, 0419, 0420, 0413): atk, atk-sys, gdk, gdk-sys, gdkwayland-sys,
+#     gdkx11-sys, gtk, gtk-sys, gtk3-macros.
+#   - `glib 0.18.5` VariantStrIter unsoundness (RUSTSEC-2024-0429).
+#   - `proc-macro-error 1.0.4` unmaintained (RUSTSEC-2024-0370).
+#
+# Upstream / out of our control:
+#   - Legacy `uuid 0.8.2` is pulled transitively by `discord-rich-presence`
+#     (a non-optional, default dep). We do not select uuid directly and cannot
+#     bump it without an upstream release; it carries no active advisory today.
+#
+# Disposition: per F14/F35 the DEFAULT dependency set is NOT changed and no
+# feature flags are trimmed — no removal is required. The tray surface stays
+# behind the off-by-default feature; this block tracks the advisories so they
+# are not mistaken for a default-build exposure.
+# ---------------------------------------------------------------------------
+
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
 notify = "8"
