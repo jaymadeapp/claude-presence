@@ -57,7 +57,8 @@ pub struct Config {
     pub assets: Assets,
     /// Tool name → display verb (e.g. `Bash` → "running"); falls back to the tool name.
     pub tool_verbs: BTreeMap<String, String>,
-    /// Card buttons (opt-in; off by default — see FR-7/AC-2).
+    /// Card buttons. Ships one default `Get claude-presence` button (on by
+    /// default); set `buttons = []` to disable. URLs MUST be `https://`.
     pub buttons: Vec<Button>,
     /// Privacy and redaction settings.
     pub privacy: PrivacySettings,
@@ -76,7 +77,10 @@ impl Default for Config {
             fields: FieldToggles::default(),
             assets: Assets::default(),
             tool_verbs: default_tool_verbs(),
-            buttons: Vec::new(),
+            buttons: vec![Button {
+                label: "Get claude-presence".to_string(),
+                url: "https://claude-presence.com".to_string(),
+            }],
             privacy: PrivacySettings::default(),
         }
     }
@@ -138,7 +142,7 @@ impl Default for Assets {
     }
 }
 
-/// A single opt-in card button. URLs MUST be `https://` (enforced downstream).
+/// A single card button. URLs MUST be `https://` (enforced downstream).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Button {
@@ -377,7 +381,9 @@ mod tests {
         assert_eq!(cfg.min_interval, 4.0);
         assert_eq!(cfg.keepalive_interval, 15.0);
         assert!(!cfg.show_ai_title, "ai-title must be off by default");
-        assert!(cfg.buttons.is_empty(), "buttons are opt-in");
+        assert_eq!(cfg.buttons.len(), 1, "ships one default attribution button");
+        assert_eq!(cfg.buttons[0].label, "Get claude-presence");
+        assert_eq!(cfg.buttons[0].url, "https://claude-presence.com");
         // Global private mode is the opt-in switch — OFF by default so the card is
         // informative (project basename + branch + activity). Baseline
         // sanitization (basename-only, bash args dropped, secrets scrubbed,

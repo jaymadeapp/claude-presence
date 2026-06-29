@@ -1086,7 +1086,7 @@ mod tests {
     }
 
     #[test]
-    fn buttons_are_opt_in_and_https_only() {
+    fn buttons_https_only_filter() {
         let cfg = Config {
             buttons: vec![
                 Button {

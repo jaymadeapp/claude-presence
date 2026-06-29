@@ -96,15 +96,16 @@
 #Task = "delegating"
 
 # --- Card buttons -----------------------------------------------------------
-# OFF by default (no buttons). The card and its buttons are PUBLIC. When enabled,
-# every URL MUST be https:// (file:// and private/credentialed URLs are rejected
-# downstream). Note: buttons may NOT render on your OWN Discord profile over local
-# IPC — they are visible to other people viewing your profile.
+# ON by default: ships one button "Get claude-presence" -> https://claude-presence.com.
+# To remove ALL buttons set `buttons = []`. The card and its buttons are PUBLIC.
+# When enabled, every URL MUST be https:// (file:// and private/credentialed URLs
+# are rejected downstream). Note: buttons may NOT render on your OWN Discord profile
+# over local IPC — they are visible to other people viewing your profile.
 #
-# Add one [[buttons]] table per button (max 2, label <= 32 chars):
-#[[buttons]]
-#label = "Project repo"
-#url = "https://github.com/you/your-repo"
+# The shipped default (uncomment to customize; max 2 buttons, label <= 32 chars):
+[[buttons]]
+label = "Get claude-presence"
+url = "https://claude-presence.com"
 
 # --- Privacy ----------------------------------------------------------------
 # Privacy-by-default (C-7, FR-7/AC-2). Only structured, sanitized fields ever

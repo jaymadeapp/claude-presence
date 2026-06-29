@@ -718,18 +718,18 @@ mod tests {
 
     #[test]
     fn buttons_check_notes_own_profile_caveat() {
-        let off = check_buttons(&Config::default());
+        // No buttons configured -> Pass (the default ships one button, so clear it
+        // explicitly to exercise the empty branch).
+        let off_cfg = Config {
+            buttons: Vec::new(),
+            ..Config::default()
+        };
+        let off = check_buttons(&off_cfg);
         assert_eq!(off.level, Level::Pass);
         assert!(off.hint.to_lowercase().contains("own"));
 
-        let cfg = Config {
-            buttons: vec![claude_presence::config::Button {
-                label: "Repo".into(),
-                url: "https://example.com".into(),
-            }],
-            ..Config::default()
-        };
-        let on = check_buttons(&cfg);
+        // The shipped default has one button -> Warn.
+        let on = check_buttons(&Config::default());
         assert_eq!(on.level, Level::Warn);
         assert!(on.hint.to_lowercase().contains("own"));
     }

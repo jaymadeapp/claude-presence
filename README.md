@@ -9,6 +9,12 @@ Discord allows one presence per application per user, so every session is folded
 into one card (never one card per session); when several sessions are active the
 card shows how many.
 
+> **TL;DR** — `brew install jaymadeapp/tap/claude-presence && claude-presence install`.
+> One Discord card for all your Claude Code sessions. No network egress, no bot
+> token (local IPC only). macOS-only, free, MIT. By [jaymade](https://claude-presence.com).
+> Turn it off anytime with `claude-presence disable`; remove it fully with
+> [Uninstall](#uninstall).
+
 ## Quick start
 
 ```sh
@@ -71,6 +77,25 @@ statusLine/hooks. **Unwire first, then uninstall the binary:**
 ```sh
 claude-presence uninstall
 brew uninstall claude-presence
+```
+
+### Uninstall with Claude Code
+
+Prefer to let Claude Code do it? Paste this prompt:
+
+```text
+Remove claude-presence (the Discord Rich Presence for Claude Code) from my Mac:
+
+1. Run: claude-presence uninstall
+   (this unwires launchd + statusLine + hooks and clears the Discord card; it
+   keeps your config.toml as user data)
+2. Then run: brew uninstall claude-presence
+3. Run `claude-presence doctor` if it still resolves, or `which claude-presence`,
+   to confirm the binary is gone.
+
+Report what each step printed. If `claude-presence uninstall` prints any [warn]
+lines (e.g. statusLine drift), show them to me verbatim — do not try to fix them
+yourself.
 ```
 
 ## Discord app setup
@@ -144,7 +169,7 @@ The Discord activity is built from the aggregated `PresenceModel`:
 | `timestamps.start` | Elapsed timer (epoch **milliseconds**): the focused session's start, or the earliest active session's start in the multi-session card. |
 | `assets.large_image` / `large_text` | Your uploaded app picture (if set) + the `Claude Code` hover tooltip (set even when no image). |
 | `assets.small_image` / `small_text` | A per-tool badge (if set) + a hover tooltip with the live activity — single session: `Running cargo`, `Editing main.rs` (verb + sanitized target); several active: `N active sessions`. The `small_text` tooltip is sent only when a `small_image` key is set. |
-| `buttons` | Off by default; `https://`-only when enabled. |
+| `buttons` | Ships one `Get claude-presence` button (`https://claude-presence.com`) by default; `https://`-only. Remove with `buttons = []`. Shown to other viewers, not on your own card. |
 
 `Ctx %` is the live context-window fill (latest-request context tokens ÷ the
 model's window, e.g. 1M for Opus 4.8). Cost is **off by default** — enable
@@ -193,9 +218,11 @@ Baseline sanitization is always on. Transcripts contain your prompts, file paths
 and possibly secrets — none of that ever leaves the process or reaches the daemon's
 own logs. Only structured, sanitized fields are emitted, to Discord **and** to logs:
 
-- **Hide the project / the running command** (`[privacy.fields]`, both shown by
-  default). `claude-presence install` asks whether to hide each (default: hide), or
-  set them directly:
+- **Hide the project / the running command** (`[privacy.fields]`). The config
+  *defaults* are shown (`project = true`, `command = true`), but `claude-presence
+  install` asks whether to hide each with the **prompt** defaulting to *hide* —
+  so a default interactive install is privacy-first, while an untouched config is
+  not. Set them directly without prompting:
   - `privacy.fields.project = false` collapses the project (and its branch) to a
     generic label.
   - `privacy.fields.command = false` hides the running command in the small-icon
@@ -217,8 +244,46 @@ own logs. Only structured, sanitized fields are emitted, to Discord **and** to l
 - **Paths are reduced to a basename** — never a full path or your home directory.
 - **Project blacklist** (`privacy.blacklist_paths`): listed projects are shown
   generically.
-- **Buttons are off by default** and, when enabled, must be `https://` (never
-  `file://` or a private/credentialed URL). The card and its buttons are public.
+- **The card ships one button by default** — `Get claude-presence` →
+  `https://claude-presence.com` — shown to **other viewers** of your profile (not on
+  your own card). Buttons must be `https://` (never `file://` or a private/credentialed
+  URL); the card and its buttons are public. There is no `--no-button` flag: remove it
+  by setting `buttons = []` in `~/.config/claude-presence/config.toml` and restarting
+  the daemon (`launchctl kickstart -k gui/$(id -u)/com.jakubsladek.claude-presence`).
+
+### Change privacy with Claude Code
+
+Already installed and want to flip what the card shows? You don't need to edit any
+files. Re-running `install` with privacy flags is **idempotent** — it rewrites the
+two `[privacy.fields]` toggles (and private mode) and restarts the daemon so the
+change takes effect immediately (config has no hot reload). Paste this prompt:
+
+```text
+Change the privacy settings of my already-installed claude-presence. Don't edit
+any files by hand — re-run the installer, which is idempotent and restarts the
+daemon for me.
+
+1. First ask me these THREE questions and WAIT for my answers:
+   - "Show your PROJECT name on the Discord card, or hide it?"
+   - "Show the COMMAND you're currently running, or hide it?"
+   - "Turn on PRIVATE mode (hides everything: project, command, model, and
+      metrics)? yes / no"
+2. Build a single command with an explicit flag for EVERY axis — never omit one,
+   because a flag-less axis defaults to HIDDEN on a non-interactive re-run:
+   - project shown  -> --show-project   | project hidden -> --hide-project
+   - command shown  -> --show-command   | command hidden -> --hide-command
+   - private = yes  -> add --private     | private = no   -> add nothing for it
+   Example (show project, hide command, private off):
+     claude-presence install -y --show-project --hide-command
+   Example (private mode on):
+     claude-presence install -y --hide-project --hide-command --private
+3. Run that command, then run `claude-presence status` and tell me it succeeded.
+
+Note: --private is a one-way switch via these flags — there is no --no-private. To
+turn private mode back OFF, tell me and I'll clear privacy.redact in
+~/.config/claude-presence/config.toml and restart the daemon with:
+  launchctl kickstart -k gui/$(id -u)/com.jakubsladek.claude-presence
+```
 
 ## Commands
 
