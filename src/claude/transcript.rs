@@ -619,9 +619,24 @@ pub fn count_subagents(subagents_dir: &Path, recency: Duration) -> u32 {
 fn scan_dir(dir: &Path, now: SystemTime, recency: Duration, count: &mut u32, tokens: &mut u64) {
     let journal = dir.join("journal.jsonl");
     if journal.is_file() {
+        // The journal is authoritative for *which* agents started and resolved,
+        // but a failed or interrupted agent can leave a `started` with no terminal
+        // event — and after the run ends those orphans would otherwise be counted
+        // as live forever (observed: journals hundreds of hours old still inflating
+        // the "N×" count). Gate them by recency: an unresolved agent is live only
+        // while the run is still active (its journal was freshly appended as agents
+        // start/finish) OR that specific agent transcript is still being written.
+        // This preserves the mtime-independence a *running* workflow needs — a busy
+        // run keeps its journal fresh, and a lone long agent keeps its own file
+        // fresh — while letting a finished/aborted run decay to zero.
+        let journal_fresh = recently_modified_path(&journal, now, recency);
         for agent_id in live_workflow_agent_ids(&journal) {
+            let agent_path = dir.join(format!("agent-{agent_id}.jsonl"));
+            if !journal_fresh && !recently_modified_path(&agent_path, now, recency) {
+                continue;
+            }
             *count += 1;
-            if let Some(t) = last_request_tokens(&dir.join(format!("agent-{agent_id}.jsonl"))) {
+            if let Some(t) = last_request_tokens(&agent_path) {
                 *tokens = tokens.saturating_add(t);
             }
         }
@@ -751,6 +766,23 @@ fn recently_modified(entry: &std::fs::DirEntry, now: SystemTime, recency: Durati
     match now.duration_since(mtime) {
         Ok(age) => age <= recency,
         // mtime in the future (clock skew): treat as fresh.
+        Err(_) => true,
+    }
+}
+
+/// Recency check by path — mtime within `recency` of `now`. Mirrors
+/// [`recently_modified`] (which reads a `DirEntry`'s cached metadata) for callers
+/// that only hold a `Path`: the workflow journal and individual agent transcripts.
+/// A missing/unreadable file is not recent; a future mtime (clock skew) is fresh.
+fn recently_modified_path(path: &Path, now: SystemTime, recency: Duration) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    let Ok(mtime) = meta.modified() else {
+        return false;
+    };
+    match now.duration_since(mtime) {
+        Ok(age) => age <= recency,
         Err(_) => true,
     }
 }
@@ -1987,6 +2019,55 @@ mod tests {
         let scan = scan_subagents(&dir.join("subagents"), Duration::from_secs(3600));
         assert_eq!(scan.count, 0);
         assert_eq!(scan.tokens, None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn stale_workflow_orphan_started_decays_to_zero() {
+        // A failed/interrupted agent leaves a `started` with no terminal event.
+        // Once the run is over (journal AND agent file both stale) such an orphan
+        // must NOT be counted — otherwise orphaned `started` lines leak the "N×"
+        // count forever across a long session.
+        let dir = unique_dir("subs-wf-orphan");
+        let wf = dir.join("subagents").join("workflows").join("wf1");
+        fs::create_dir_all(&wf).unwrap();
+        write_agent_with_usage(&wf.join("agent-x.jsonl"), true, 10, 200, 5); // 215
+        write_journal(
+            &wf.join("journal.jsonl"),
+            &[r#"{"type":"started","key":"k-x","agentId":"x"}"#], // no terminal → orphan
+        );
+        let stale = SystemTime::now() - Duration::from_secs(600);
+        for name in ["agent-x.jsonl", "journal.jsonl"] {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(wf.join(name))
+                .unwrap()
+                .set_modified(stale)
+                .unwrap();
+        }
+        // Journal + agent both stale → run is over → the orphan is dead.
+        let scan = scan_subagents(&dir.join("subagents"), Duration::from_secs(30));
+        assert_eq!(
+            scan.count, 0,
+            "orphaned started from a finished run must not count"
+        );
+        assert_eq!(scan.tokens, None);
+
+        // Agent transcript freshly written again → a genuinely long-running agent,
+        // still live even though the journal is stale.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(wf.join("agent-x.jsonl"))
+            .unwrap()
+            .set_modified(SystemTime::now())
+            .unwrap();
+        let scan = scan_subagents(&dir.join("subagents"), Duration::from_secs(30));
+        assert_eq!(
+            scan.count, 1,
+            "a fresh agent transcript keeps a long-running orphan live"
+        );
+        assert_eq!(scan.tokens, Some(215));
+
         fs::remove_dir_all(&dir).unwrap();
     }
 

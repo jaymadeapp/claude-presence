@@ -1,6 +1,6 @@
 [package]
 name = "claude-presence"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "Rust daemon (macOS) that aggregates live Claude Code activity into a single Discord Rich Presence."
 license = "MIT"
