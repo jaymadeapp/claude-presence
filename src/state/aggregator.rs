@@ -390,8 +390,8 @@ fn format_details(
 struct StateInputs {
     /// Focused session model id (e.g. `claude-opus-4-8`); `None` → "Claude".
     model: Option<String>,
-    /// Total live subagents across all sessions; `>0` renders an "N×" prefix on
-    /// the model (e.g. `20× Opus 4.8`), `0` renders none. Ignored when
+    /// Total live subagents across all sessions; `>1` renders an "N×" prefix on
+    /// the model (e.g. `20× Opus 4.8`); `0` or `1` renders none (a ×1 is noise). Ignored when
     /// [`Self::multi_agents`] is set (the generic label carries no prefix).
     agent_count: u32,
     /// When the multi-session card spans more than one distinct model, `Some(n)`
@@ -424,7 +424,10 @@ fn format_state(cfg: &Config, inputs: &StateInputs) -> String {
         None => {
             let full = pretty_model(inputs.model.as_deref().unwrap_or("Claude"));
             let short = abbreviate_model(&full);
-            let prefix = (inputs.agent_count > 0).then(|| format!("{}\u{d7}", inputs.agent_count));
+            // A lone subagent (count 1) renders no prefix — a "1×" multiplier is
+            // noise (×1 says nothing) and reads oddly next to a multi-session
+            // headline. The prefix appears only once there is real fan-out (>= 2).
+            let prefix = (inputs.agent_count > 1).then(|| format!("{}\u{d7}", inputs.agent_count));
             (full, short, prefix)
         }
     };
@@ -1175,7 +1178,10 @@ mod tests {
     }
 
     #[test]
-    fn single_session_with_one_agent_shows_count_in_state() {
+    fn single_subagent_renders_no_multiplier_prefix() {
+        // A lone subagent (count 1) must NOT render a "1×" prefix — ×1 is noise and
+        // reads oddly (e.g. next to a multi-session headline). The model shows
+        // plainly; the "N×" prefix appears only at >= 2 subagents.
         let mut s = session("a", 10);
         s.subagents = 1;
         let mut aggregator = Aggregator::new(Config::default());
@@ -1187,7 +1193,12 @@ mod tests {
             "{}",
             model.details
         );
-        assert!(model.state.contains("1\u{d7} Opus 4.8"), "{}", model.state);
+        assert!(model.state.contains("Opus 4.8"), "{}", model.state);
+        assert!(
+            !model.state.contains('\u{d7}'),
+            "no ×1 multiplier: {}",
+            model.state
+        );
     }
 
     #[test]
