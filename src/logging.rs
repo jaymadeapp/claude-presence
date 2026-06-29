@@ -1,20 +1,25 @@
 //! Logging setup: `tracing-subscriber` + a rotating file appender.
 //!
-//! # Privacy contract (FR-8/AC-4, NFR-3, C-7)
+//! # Privacy contract (FR-1/AC-6, FR-8/AC-4, NFR-3, C-7)
 //!
 //! Logs are as sensitive as the Discord card: they MUST NOT contain raw
 //! `tool_input`, prompt/transcript text, full filesystem paths, or unredacted
 //! statusline JSON — only the same sanitized summaries that are emitted to
 //! Discord. This module owns the *sink*, not the *content*: it cannot inspect
-//! every value a call site passes. The guarantee is therefore split:
+//! every value a call site passes, so it does NOT guarantee sanitization "by
+//! construction". The privacy module is the **sanitizer of record**, and the
+//! guarantee rests on two parts:
 //!
 //! * **Here** — the sink writes nowhere but a `0600` file inside a `0700`
 //!   directory owned by the current user, and this module itself logs no
 //!   sensitive data.
-//! * **At every call site** — code MUST pass only sanitized fields. Paths are
-//!   reduced to basenames, bash arguments are dropped/scrubbed, and raw
-//!   payloads are summarized *before* they reach a `tracing` macro. Run any
-//!   user-derived string through `crate::privacy` first; never log a
+//! * **At every call site** — code MUST pass only sanitized fields. Any
+//!   user-derived string is run through [`crate::privacy::redact_text`] *before*
+//!   it reaches a `tracing` macro: that function strips known secret formats and
+//!   credentialed URLs and reduces filesystem paths to their basename, so a
+//!   stray path or secret cannot leak into a log line. Bash arguments are
+//!   dropped/scrubbed via `crate::privacy::scrub_bash_command` and larger
+//!   payloads are summarized (e.g. an overlay's `log_summary`). Never log a
 //!   `tool_input`, a transcript line, or a statusline body verbatim.
 //!
 //! The file appender rotates daily (`tracing-appender`), so old logs age out
@@ -52,7 +57,8 @@ const DEFAULT_FILTER: &str = "info";
 /// it flushes and stops the background writer, so buffered lines would be lost.
 ///
 /// Callers are responsible for the privacy contract documented at the module
-/// level: only sanitized summaries may be logged.
+/// level: user-derived text is sanitized via [`crate::privacy::redact_text`]
+/// (the sanitizer of record) before being logged.
 pub fn init() -> Result<WorkerGuard> {
     let log_dir = state_log_dir()?;
     ensure_dir_0700(&log_dir)?;

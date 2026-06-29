@@ -78,12 +78,16 @@ fn state_file_path() -> Result<PathBuf> {
     Ok(state_dir()?.join("statusline-state.sh"))
 }
 
-/// The string written into `statusLine.command` — the absolute wrapper path.
+/// The string written into `statusLine.command` — the absolute wrapper path,
+/// **single-quoted** so a path containing a space or shell metacharacter is inert
+/// when Claude Code runs the command through a shell (F5, ADR-3).
 ///
-/// This exact value is what [`uninstall`] compares against to distinguish "still
-/// our wrapper" (restore) from "user changed it" (drift → warn, don't clobber).
+/// This exact (quoted) value is what [`uninstall`] compares against in the equality
+/// branch to distinguish "still our wrapper" (restore) from "user changed it" (drift
+/// → warn, don't clobber). A pre-quoting install stored the *bare* path instead; the
+/// uninstall/wiring checks accept that legacy form too (see [`wrapper_path`]).
 fn wrapper_invocation() -> Result<String> {
-    Ok(wrapper_path()?.to_string_lossy().into_owned())
+    Ok(shell_single_quote(&wrapper_path()?.to_string_lossy()))
 }
 
 /// Whether `~/.claude/settings.json`'s `statusLine.command` currently points at
@@ -95,14 +99,24 @@ fn wrapper_invocation() -> Result<String> {
 pub fn is_wired() -> Result<bool> {
     let settings = read_settings(&settings_path()?)?;
     let wrapper_inv = wrapper_invocation()?;
-    Ok(statusline_wired(&settings, &wrapper_inv))
+    let bare = wrapper_path()?.to_string_lossy().into_owned();
+    Ok(statusline_wired(&settings, &wrapper_inv, &bare))
 }
 
-/// Pure: does `settings`'s `statusLine.command` equal `wrapper_invocation`?
+/// Pure: does `settings`'s `statusLine.command` equal our installed wrapper?
 ///
-/// Tolerates both shapes via [`extract_command`]; `None` (unset) is not wired.
-fn statusline_wired(settings: &Map<String, Value>, wrapper_invocation: &str) -> bool {
-    extract_command(settings).as_deref() == Some(wrapper_invocation)
+/// Recognizes both the current **quoted** `wrapper_invocation` and the **legacy bare**
+/// path written by a pre-quoting install (F5, ADR-3). Tolerates both settings shapes
+/// via [`extract_command`]; `None` (unset) is not wired.
+fn statusline_wired(
+    settings: &Map<String, Value>,
+    wrapper_invocation: &str,
+    wrapper_bare: &str,
+) -> bool {
+    match extract_command(settings).as_deref() {
+        Some(cmd) => cmd == wrapper_invocation || cmd == wrapper_bare,
+        None => false,
+    }
 }
 
 /// Absolute path of the current executable (the `claude-presence` binary), so the
@@ -141,23 +155,28 @@ fn read_settings(path: &Path) -> Result<Map<String, Value>> {
 fn write_settings(path: &Path, settings: &Map<String, Value>) -> Result<()> {
     let mut text = serde_json::to_string_pretty(&Value::Object(settings.clone()))?;
     text.push('\n');
-    write_atomic(path, &text)?;
+    write_atomic(path, text.as_bytes())?;
     Ok(())
 }
 
 /// Write `contents` to `path` atomically and durably: stream into a sibling
-/// `<name>.json.tmp`, `fsync` it, then `rename` over `path`. The rename is atomic
+/// `<file-name>.tmp`, `fsync` it, then `rename` over `path`. The rename is atomic
 /// within a filesystem, so a crash / power-loss / ENOSPC mid-write can never leave
-/// the user's `settings.json` truncated or half-written (C-6, NFR-6).
-fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+/// the target (the user's `settings.json`, or our wrapper script / state file)
+/// truncated or half-written (C-6, F26, NFR-6). The `.tmp` suffix is *appended* to the
+/// full file name (not substituted for the extension) so it is correct for any target,
+/// including the extensionless-vs-`.sh` wrapper artifacts.
+fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("json.tmp");
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
     {
         use std::io::Write;
         let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(contents.as_bytes())?;
+        f.write_all(contents)?;
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)?;
@@ -201,26 +220,34 @@ fn apply_install(
     (settings, original)
 }
 
-/// Pure uninstall transform with drift handling (ADR-4).
+/// Pure uninstall transform with drift handling (ADR-3, ADR-4).
 ///
-/// * If the current `statusLine.command` still equals `wrapper_invocation` (no
-///   drift): restore `stored_original` exactly, or remove the `statusLine` key
-///   entirely when there was no original.
-/// * If it has drifted (user replaced it since install): leave it untouched (the
-///   caller warns). Only when the *drifted* value still literally contains our
-///   wrapper path do we surgically drop the `statusLine` key as well, so we never
-///   leave a dangling reference to a removed wrapper.
+/// The wrapper path is now written **single-quoted** (`wrapper_invocation`), but a
+/// pre-quoting install stored the **bare** path (`wrapper_bare`); both must round-trip
+/// cleanly, so the two identity branches are matched distinctly (ADR-3):
+///
+/// * **Equality (no drift):** the current `statusLine.command` is exactly our value —
+///   either the quoted `wrapper_invocation` (current installs) or the legacy bare
+///   `wrapper_bare` (pre-quoting installs). Restore `stored_original` exactly, or remove
+///   the `statusLine` key entirely when there was no original.
+/// * **Contains (drift):** the user replaced our value with something that still *embeds*
+///   the raw (unquoted) `wrapper_bare` path — a drifted/hand-composed value won't carry
+///   our exact quoting, so membership is tested against the bare path. Surgically drop
+///   the `statusLine` key so we never leave a dangling reference to a removed wrapper.
+/// * Otherwise (drifted to an unrelated value, or unset): leave it untouched.
 ///
 /// Returns `(new_settings, drifted)` so the caller can `warn!` on drift.
 fn apply_uninstall(
     mut settings: Map<String, Value>,
     wrapper_invocation: &str,
+    wrapper_bare: &str,
     stored_original: Option<&str>,
 ) -> (Map<String, Value>, bool) {
     let current = extract_command(&settings);
     match current.as_deref() {
-        // No drift: the value is exactly our wrapper invocation.
-        Some(cmd) if cmd == wrapper_invocation => {
+        // No drift: the value is exactly our wrapper invocation — current quoted form
+        // or the legacy bare path a pre-quoting install wrote.
+        Some(cmd) if cmd == wrapper_invocation || cmd == wrapper_bare => {
             match stored_original {
                 Some(orig) => {
                     let mut obj = Map::new();
@@ -234,9 +261,10 @@ fn apply_uninstall(
             }
             (settings, false)
         }
-        // Drifted but the new value still embeds our wrapper path → surgically drop
-        // the statusLine key (it would otherwise point at a removed wrapper).
-        Some(cmd) if cmd.contains(wrapper_invocation) => {
+        // Drifted but the new value still embeds our raw (unquoted) wrapper path →
+        // surgically drop the statusLine key (it would otherwise point at a removed
+        // wrapper). Membership is tested against the bare path, not the quoted form.
+        Some(cmd) if cmd.contains(wrapper_bare) => {
             settings.remove("statusLine");
             (settings, true)
         }
@@ -305,24 +333,33 @@ pub fn install() -> Result<()> {
     let settings_file = settings_path()?;
     let settings = read_settings(&settings_file)?;
     let wrapper_inv = wrapper_invocation()?;
+    let wrapper_bare = wrapper_path()?.to_string_lossy().into_owned();
 
     let (new_settings, captured) = apply_install(settings, &wrapper_inv);
     // If we are re-installing over our own wrapper, the captured value is the
     // wrapper itself; do not store that as the "original" (it would self-reference).
+    // Recognize BOTH our current quoted invocation and the legacy bare path a
+    // pre-quoting install wrote (exactly as `apply_uninstall` accepts both, ADR-3):
+    // on an upgrade-from-legacy the captured value is the bare wrapper path, and
+    // storing it as the original would later restore `statusLine.command` to a
+    // wrapper that uninstall has since deleted — a dangling self-reference.
     let original = match captured {
-        Some(ref c) if *c == wrapper_inv => None,
+        Some(ref c) if *c == wrapper_inv || *c == wrapper_bare => None,
         other => other,
     };
 
-    // Write the wrapper script (0755) and the runtime state file (0600).
+    // Write the wrapper script (0755) and the runtime state file (0600) atomically
+    // (temp+fsync+rename) so a re-install never exposes a truncated/partial executable
+    // while settings.json already points at it (F26, FR-3/AC-3). The final mode is set
+    // *after* the rename, on the live path.
     let wrapper = wrapper_path()?;
-    std::fs::write(&wrapper, WRAPPER_SCRIPT)?;
+    write_atomic(&wrapper, WRAPPER_SCRIPT.as_bytes())?;
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))?;
 
     let forward_bin = current_binary()?;
     let state = render_state_file(&forward_bin.to_string_lossy(), original.as_deref());
     let state_file = state_file_path()?;
-    std::fs::write(&state_file, state)?;
+    write_atomic(&state_file, state.as_bytes())?;
     std::fs::set_permissions(&state_file, std::fs::Permissions::from_mode(0o600))?;
 
     write_settings(&settings_file, &new_settings)?;
@@ -342,10 +379,15 @@ pub fn uninstall() -> Result<()> {
     let settings_file = settings_path()?;
     let settings = read_settings(&settings_file)?;
     let wrapper_inv = wrapper_invocation()?;
+    let wrapper_bare = wrapper_path()?.to_string_lossy().into_owned();
     let stored_original = read_stored_original()?;
 
-    let (new_settings, drifted) =
-        apply_uninstall(settings, &wrapper_inv, stored_original.as_deref());
+    let (new_settings, drifted) = apply_uninstall(
+        settings,
+        &wrapper_inv,
+        &wrapper_bare,
+        stored_original.as_deref(),
+    );
     if drifted {
         warn!(
             target: "install",
@@ -439,7 +481,12 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const WRAPPER: &str = "/home/u/.local/state/claude-presence/statusline-wrapper.sh";
+    /// The raw, unquoted absolute wrapper path (what a pre-quoting install wrote into
+    /// `statusLine.command`, and what the contains/drift branch matches membership on).
+    const BARE_WRAPPER: &str = "/home/u/.local/state/claude-presence/statusline-wrapper.sh";
+    /// The current install value: the bare path wrapped in `shell_single_quote` (F5,
+    /// ADR-3). Equality must accept this AND `BARE_WRAPPER` (legacy installs).
+    const QUOTED_WRAPPER: &str = "'/home/u/.local/state/claude-presence/statusline-wrapper.sh'";
     const ORIGINAL: &str = "input=$(cat); echo \"$input\" | jq -r '.model.display_name'";
 
     fn obj(v: Value) -> Map<String, Value> {
@@ -456,10 +503,10 @@ mod tests {
             "statusLine": { "type": "command", "command": ORIGINAL },
             "hooks": { "Stop": [] }
         }));
-        let (new, captured) = apply_install(settings, WRAPPER);
+        let (new, captured) = apply_install(settings, QUOTED_WRAPPER);
         assert_eq!(captured.as_deref(), Some(ORIGINAL));
-        // statusLine now points at our wrapper, normalised to object form.
-        assert_eq!(new["statusLine"]["command"].as_str(), Some(WRAPPER));
+        // statusLine now points at our quoted wrapper, normalised to object form.
+        assert_eq!(new["statusLine"]["command"].as_str(), Some(QUOTED_WRAPPER));
         assert_eq!(new["statusLine"]["type"].as_str(), Some("command"));
         // Other keys preserved untouched — crucially `hooks` (task 3.3 owns it).
         assert_eq!(new["model"].as_str(), Some("Opus"));
@@ -469,17 +516,17 @@ mod tests {
     #[test]
     fn install_captures_plain_string_form() {
         let settings = obj(json!({ "statusLine": ORIGINAL }));
-        let (new, captured) = apply_install(settings, WRAPPER);
+        let (new, captured) = apply_install(settings, QUOTED_WRAPPER);
         assert_eq!(captured.as_deref(), Some(ORIGINAL));
-        assert_eq!(new["statusLine"]["command"].as_str(), Some(WRAPPER));
+        assert_eq!(new["statusLine"]["command"].as_str(), Some(QUOTED_WRAPPER));
     }
 
     #[test]
     fn install_with_no_original_statusline() {
         let settings = obj(json!({ "model": "Opus" }));
-        let (new, captured) = apply_install(settings, WRAPPER);
+        let (new, captured) = apply_install(settings, QUOTED_WRAPPER);
         assert_eq!(captured, None);
-        assert_eq!(new["statusLine"]["command"].as_str(), Some(WRAPPER));
+        assert_eq!(new["statusLine"]["command"].as_str(), Some(QUOTED_WRAPPER));
         assert_eq!(new["model"].as_str(), Some("Opus"));
     }
 
@@ -490,8 +537,9 @@ mod tests {
             "model": "Opus",
             "statusLine": { "type": "command", "command": ORIGINAL }
         }));
-        let (installed, captured) = apply_install(settings, WRAPPER);
-        let (restored, drifted) = apply_uninstall(installed, WRAPPER, captured.as_deref());
+        let (installed, captured) = apply_install(settings, QUOTED_WRAPPER);
+        let (restored, drifted) =
+            apply_uninstall(installed, QUOTED_WRAPPER, BARE_WRAPPER, captured.as_deref());
         assert!(!drifted);
         assert_eq!(restored["statusLine"]["command"].as_str(), Some(ORIGINAL));
         assert_eq!(restored["model"].as_str(), Some("Opus"));
@@ -500,9 +548,9 @@ mod tests {
     #[test]
     fn uninstall_no_original_removes_key_cleanly() {
         let settings = obj(json!({ "model": "Opus" }));
-        let (installed, captured) = apply_install(settings, WRAPPER);
+        let (installed, captured) = apply_install(settings, QUOTED_WRAPPER);
         assert_eq!(captured, None);
-        let (restored, drifted) = apply_uninstall(installed, WRAPPER, None);
+        let (restored, drifted) = apply_uninstall(installed, QUOTED_WRAPPER, BARE_WRAPPER, None);
         assert!(!drifted);
         assert!(
             !restored.contains_key("statusLine"),
@@ -518,7 +566,8 @@ mod tests {
         let settings = obj(json!({
             "statusLine": { "type": "command", "command": user_cmd }
         }));
-        let (out, drifted) = apply_uninstall(settings, WRAPPER, Some(ORIGINAL));
+        let (out, drifted) =
+            apply_uninstall(settings, QUOTED_WRAPPER, BARE_WRAPPER, Some(ORIGINAL));
         assert!(drifted, "a user-modified value must be detected as drift");
         // Their value is left exactly as-is — never clobbered.
         assert_eq!(out["statusLine"]["command"].as_str(), Some(user_cmd));
@@ -527,7 +576,8 @@ mod tests {
     #[test]
     fn uninstall_drift_unset_is_noop() {
         let settings = obj(json!({ "model": "Opus" }));
-        let (out, drifted) = apply_uninstall(settings, WRAPPER, Some(ORIGINAL));
+        let (out, drifted) =
+            apply_uninstall(settings, QUOTED_WRAPPER, BARE_WRAPPER, Some(ORIGINAL));
         assert!(drifted);
         assert!(!out.contains_key("statusLine"));
         assert_eq!(out["model"].as_str(), Some("Opus"));
@@ -536,14 +586,141 @@ mod tests {
     #[test]
     fn uninstall_drift_embedding_wrapper_drops_segment() {
         // The user wrapped OUR wrapper in something else; the value still embeds
-        // our path, so removing the now-dangling segment is correct.
-        let drifted_cmd = format!("{WRAPPER} ; echo extra");
+        // our raw (unquoted) path, so the contains/drift branch — which matches
+        // membership against the BARE wrapper path — removes the now-dangling segment.
+        let drifted_cmd = format!("{BARE_WRAPPER} ; echo extra");
         let settings = obj(json!({
             "statusLine": { "type": "command", "command": drifted_cmd }
         }));
-        let (out, drifted) = apply_uninstall(settings, WRAPPER, Some(ORIGINAL));
+        let (out, drifted) =
+            apply_uninstall(settings, QUOTED_WRAPPER, BARE_WRAPPER, Some(ORIGINAL));
         assert!(drifted);
         assert!(!out.contains_key("statusLine"));
+    }
+
+    #[test]
+    fn uninstall_legacy_bare_command_restores_without_dangling_reference() {
+        // A pre-quoting install stored the BARE (unquoted) wrapper path verbatim.
+        // After upgrading, uninstall must still recognize it via the equality branch
+        // (legacy-bare acceptance) and restore the original exactly — no drift, no
+        // dangling reference left behind (ADR-3 migration, NFR-4).
+        let settings = obj(json!({
+            "model": "Opus",
+            "statusLine": { "type": "command", "command": BARE_WRAPPER }
+        }));
+        let (restored, drifted) =
+            apply_uninstall(settings, QUOTED_WRAPPER, BARE_WRAPPER, Some(ORIGINAL));
+        assert!(!drifted, "the legacy bare form is our wrapper, not drift");
+        assert_eq!(restored["statusLine"]["command"].as_str(), Some(ORIGINAL));
+        assert_eq!(restored["model"].as_str(), Some("Opus"));
+    }
+
+    #[test]
+    fn uninstall_legacy_bare_command_no_original_removes_key() {
+        // Legacy bare install with no captured original → the key is removed cleanly
+        // (no dangling reference to the now-deleted wrapper).
+        let settings = obj(json!({
+            "statusLine": { "type": "command", "command": BARE_WRAPPER }
+        }));
+        let (out, drifted) = apply_uninstall(settings, QUOTED_WRAPPER, BARE_WRAPPER, None);
+        assert!(!drifted);
+        assert!(
+            !out.contains_key("statusLine"),
+            "a legacy bare install with no original must drop the statusLine key"
+        );
+    }
+
+    /// Replicates the `install()` self-reference guard so the upgrade-from-legacy
+    /// round-trip can be exercised without touching the real filesystem. Must stay
+    /// in lockstep with the guard in `install()`.
+    fn install_guarded_original(
+        captured: Option<String>,
+        wrapper_inv: &str,
+        wrapper_bare: &str,
+    ) -> Option<String> {
+        match captured {
+            Some(ref c) if *c == wrapper_inv || *c == wrapper_bare => None,
+            other => other,
+        }
+    }
+
+    #[test]
+    fn upgrade_from_legacy_bare_install_then_uninstall_leaves_no_dangling_self_reference() {
+        // Pre-quoting (legacy) install: settings.json's statusLine.command is the
+        // BARE wrapper path. The user upgrades to a quoting build and re-installs,
+        // then uninstalls. The result must NOT restore statusLine.command to the
+        // bare wrapper path (which uninstall just deleted) — a dangling
+        // self-reference. (ADR-3 migration, FR-3/AC-1, NFR-4.)
+        let settings = obj(json!({
+            "model": "Opus",
+            "statusLine": { "type": "command", "command": BARE_WRAPPER }
+        }));
+
+        // install(): capture the current command (the bare wrapper), then apply the
+        // self-reference guard against BOTH the quoted and bare wrapper forms.
+        let (installed, captured) = apply_install(settings, QUOTED_WRAPPER);
+        assert_eq!(
+            captured.as_deref(),
+            Some(BARE_WRAPPER),
+            "the legacy install's command is the bare wrapper path"
+        );
+        let stored_original = install_guarded_original(captured, QUOTED_WRAPPER, BARE_WRAPPER);
+        assert_eq!(
+            stored_original, None,
+            "the bare wrapper must be recognised as our own wrapper, never stored as the original"
+        );
+
+        // uninstall(): settings now points at the quoted wrapper; restore the stored
+        // original (None) → the statusLine key is removed, not left dangling.
+        let (restored, drifted) = apply_uninstall(
+            installed,
+            QUOTED_WRAPPER,
+            BARE_WRAPPER,
+            stored_original.as_deref(),
+        );
+        assert!(
+            !drifted,
+            "uninstalling our own freshly-installed wrapper is not drift"
+        );
+        assert!(
+            !restored.contains_key("statusLine"),
+            "statusLine must be removed; it must NOT point at the deleted bare wrapper"
+        );
+        // And in particular it is never restored to the (now-deleted) wrapper path.
+        assert_ne!(
+            restored
+                .get("statusLine")
+                .and_then(|s| s.get("command"))
+                .and_then(Value::as_str),
+            Some(BARE_WRAPPER),
+            "no dangling self-reference to the removed wrapper"
+        );
+        assert_eq!(restored["model"].as_str(), Some("Opus"));
+    }
+
+    #[test]
+    fn install_guard_preserves_a_real_prior_original() {
+        // Sanity: a genuine user command (not our wrapper, quoted or bare) is NOT
+        // swallowed by the self-reference guard — it is stored and later restored.
+        let real_original = "echo my-status";
+        let stored = install_guarded_original(
+            Some(real_original.to_string()),
+            QUOTED_WRAPPER,
+            BARE_WRAPPER,
+        );
+        assert_eq!(stored.as_deref(), Some(real_original));
+
+        let installed = obj(json!({
+            "statusLine": { "type": "command", "command": QUOTED_WRAPPER }
+        }));
+        let (restored, drifted) =
+            apply_uninstall(installed, QUOTED_WRAPPER, BARE_WRAPPER, stored.as_deref());
+        assert!(!drifted);
+        assert_eq!(
+            restored["statusLine"]["command"].as_str(),
+            Some(real_original),
+            "a real prior original is restored, not dropped"
+        );
     }
 
     #[test]
@@ -577,24 +754,35 @@ mod tests {
 
     #[test]
     fn wired_when_command_equals_wrapper_else_not() {
+        // The current QUOTED form is wired.
         let wired = obj(json!({
-            "statusLine": { "type": "command", "command": WRAPPER }
+            "statusLine": { "type": "command", "command": QUOTED_WRAPPER }
         }));
-        assert!(statusline_wired(&wired, WRAPPER));
+        assert!(statusline_wired(&wired, QUOTED_WRAPPER, BARE_WRAPPER));
+
+        // The LEGACY bare form (pre-quoting install) is also recognised as wired.
+        let wired_legacy = obj(json!({
+            "statusLine": { "type": "command", "command": BARE_WRAPPER }
+        }));
+        assert!(statusline_wired(
+            &wired_legacy,
+            QUOTED_WRAPPER,
+            BARE_WRAPPER
+        ));
 
         // A user value (drift) is not wired.
         let drifted = obj(json!({
             "statusLine": { "type": "command", "command": "echo custom" }
         }));
-        assert!(!statusline_wired(&drifted, WRAPPER));
+        assert!(!statusline_wired(&drifted, QUOTED_WRAPPER, BARE_WRAPPER));
 
         // Unset statusLine is not wired.
         let unset = obj(json!({ "model": "Opus" }));
-        assert!(!statusline_wired(&unset, WRAPPER));
+        assert!(!statusline_wired(&unset, QUOTED_WRAPPER, BARE_WRAPPER));
 
-        // The plain-string form is also recognised.
-        let plain = obj(json!({ "statusLine": WRAPPER }));
-        assert!(statusline_wired(&plain, WRAPPER));
+        // The plain-string form is also recognised (quoted).
+        let plain = obj(json!({ "statusLine": QUOTED_WRAPPER }));
+        assert!(statusline_wired(&plain, QUOTED_WRAPPER, BARE_WRAPPER));
     }
 
     #[test]
@@ -604,7 +792,7 @@ mod tests {
         let path = dir.join("settings.json");
         let contents = "{\n  \"model\": \"Opus\"\n}\n";
 
-        write_atomic(&path, contents).unwrap();
+        write_atomic(&path, contents.as_bytes()).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
         // No leftover temp file beside the target.
         assert!(
@@ -614,7 +802,7 @@ mod tests {
 
         // Overwriting an existing file works and still leaves no temp.
         let next = "{\n  \"model\": \"Sonnet\"\n}\n";
-        write_atomic(&path, next).unwrap();
+        write_atomic(&path, next.as_bytes()).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), next);
         assert!(!path.with_extension("json.tmp").exists());
 

@@ -11,8 +11,9 @@
 //! matching session's [`SessionState`]. Nothing past the parse boundary retains
 //! raw `tool_input`, prompt text, or full paths (C-7 / FR-8/AC-4): the only
 //! free-text that survives is an [`crate::state::model::Activity`] already run
-//! through `privacy.rs`/`activity.rs`, and the basename-or-generic `cwd` is kept
-//! solely so the run loop can apply the blacklist when matching a session.
+//! through `privacy.rs`/`activity.rs`. The `Overlay` carries no path at all —
+//! sessions are matched by `session_id`, and the blacklist is applied against a
+//! session's own discovered `cwd`, not anything from these frames.
 
 use serde::Deserialize;
 
@@ -50,9 +51,6 @@ pub struct HookFrame {
     /// Session id the event belongs to (matches `SessionState::session_id`).
     #[serde(default)]
     pub session_id: Option<String>,
-    /// Working directory when the hook fired (used for blacklist matching only).
-    #[serde(default)]
-    pub cwd: Option<String>,
     /// Tool name on `PreToolUse`/`PostToolUse`.
     #[serde(default)]
     pub tool_name: Option<String>,
@@ -75,27 +73,15 @@ pub struct StatuslineFrame {
     /// Session id this statusLine belongs to.
     #[serde(default)]
     pub session_id: Option<String>,
-    /// Working directory (basename-only / blacklist matching).
-    #[serde(default)]
-    pub cwd: Option<String>,
     /// Model display name, e.g. `Opus 4.8` (overrides the transcript model).
     #[serde(default)]
     pub model: Option<String>,
-    /// Reasoning effort level, informational (`low`/`high`/…).
-    #[serde(default)]
-    pub effort: Option<String>,
     /// Exact session cost in USD (overrides the computed estimate).
     #[serde(default)]
     pub cost_usd: Option<f64>,
     /// Exact context-window usage percentage (overrides the computed estimate).
     #[serde(default)]
     pub ctx_pct: Option<f64>,
-    /// Context-window size in tokens, informational.
-    #[serde(default)]
-    pub ctx_size: Option<u64>,
-    /// CLI version that produced the statusLine, informational.
-    #[serde(default)]
-    pub version: Option<String>,
 }
 
 impl StatuslineFrame {
@@ -106,22 +92,19 @@ impl StatuslineFrame {
     /// from the full statusLine adapter ([`schema::StatusLine`]) so a wrapper
     /// that simply tees CC's raw stdin still yields a usable overlay (FR-3/AC-2).
     fn from_value(value: serde_json::Value) -> Self {
-        let mut frame: StatuslineFrame = serde_json::from_value(value.clone()).unwrap_or_default();
+        // Try the compact shape by *borrowing* the value, so the owned `value`
+        // is still available for the full-schema backfill without cloning it
+        // (FR-7/AC-4).
+        let mut frame: StatuslineFrame = StatuslineFrame::deserialize(&value).unwrap_or_default();
 
         // Backfill from the full statusLine contract for a wrapper that forwards
-        // CC's raw JSON unchanged.
+        // CC's raw JSON unchanged (consumes the owned value — no clone).
         if let Ok(full) = serde_json::from_value::<schema::StatusLine>(value) {
             if frame.session_id.is_none() {
                 frame.session_id = full.session_id;
             }
-            if frame.cwd.is_none() {
-                frame.cwd = full.cwd;
-            }
             if frame.model.is_none() {
                 frame.model = full.model.and_then(|m| m.display_name.or(m.id));
-            }
-            if frame.effort.is_none() {
-                frame.effort = full.effort.and_then(|e| e.level);
             }
             if let Some(cost) = full.cost.as_ref() {
                 if frame.cost_usd.is_none() {
@@ -132,12 +115,6 @@ impl StatuslineFrame {
                 if frame.ctx_pct.is_none() {
                     frame.ctx_pct = ctx.used_percentage;
                 }
-                if frame.ctx_size.is_none() {
-                    frame.ctx_size = ctx.context_window_size;
-                }
-            }
-            if frame.version.is_none() {
-                frame.version = full.version;
             }
         }
         frame

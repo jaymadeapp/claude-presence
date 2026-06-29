@@ -19,8 +19,13 @@ use serde::{Deserialize, Serialize};
 /// See CLAUDE.md → "Project specifics".
 pub const DEFAULT_CLIENT_ID: u64 = 1518007333324587168;
 
-/// Minimum spacing between Discord `SET_ACTIVITY` pushes, in seconds (FR-6/AC-3).
-const DEFAULT_MIN_INTERVAL_SECS: f64 = 2.5;
+/// Minimum spacing between Discord `SET_ACTIVITY` pushes, in seconds (FR-2/AC-1).
+///
+/// 4.0s so steady-state spacing keeps presence updates under Discord's ~5/20s
+/// budget. Must stay in sync with the sink's local `FALLBACK_MIN_INTERVAL`
+/// (`discord::sink`), which hard-codes the same 4.0s as its invalid-input floor
+/// (the two are kept file-disjoint on purpose and must agree by comment).
+const DEFAULT_MIN_INTERVAL_SECS: f64 = 4.0;
 /// Keep-alive republish cadence so the presence does not expire, in seconds.
 const DEFAULT_KEEPALIVE_INTERVAL_SECS: f64 = 15.0;
 /// How recently a subagent must have been active to count as "current", in seconds.
@@ -219,6 +224,22 @@ fn default_tool_verbs() -> BTreeMap<String, String> {
     .collect()
 }
 
+/// Expand a leading `~` (`~` or `~/…`) in `entry` to `home`.
+///
+/// Returns `Some` with the expanded path when `entry` starts with a `~`
+/// component, otherwise `None` (the caller keeps the original entry). Only the
+/// literal `~` / `~/` prefix is handled — `~user` is left untouched. No symlink
+/// resolution, so the blacklist superset property is preserved.
+fn expand_tilde(entry: &std::path::Path, home: &std::path::Path) -> Option<PathBuf> {
+    let mut components = entry.components();
+    match components.next() {
+        Some(std::path::Component::Normal(first)) if first == "~" => {
+            Some(home.join(components.as_path()))
+        }
+        _ => None,
+    }
+}
+
 impl Config {
     /// Path to the on-disk config: `~/.config/claude-presence/config.toml`.
     ///
@@ -265,7 +286,30 @@ impl Config {
 
     /// Parse a [`Config`] from a TOML string.
     pub fn from_toml(contents: &str) -> Result<Self, toml::de::Error> {
-        toml::from_str(contents)
+        let mut cfg: Self = toml::from_str(contents)?;
+        cfg.normalize();
+        Ok(cfg)
+    }
+
+    /// One-time, post-deserialize cleanup of an otherwise-valid config.
+    ///
+    /// - Clamps `keepalive_interval` up to `min_interval` so a misconfigured
+    ///   keepalive cannot republish inside the rate floor (FR-2/AC-1, F19).
+    /// - Expands a leading `~` in each `blacklist_paths` entry to the home dir
+    ///   (best-effort; left as-is if the home dir can't be resolved). This is the
+    ///   config-load ENTRY normalization the `privacy` blacklist matcher relies on.
+    ///   It is `~`-expansion ONLY — symlinks are deliberately not resolved, so the
+    ///   matcher's superset guarantee is preserved (FR-1/AC-5, F29/F31).
+    fn normalize(&mut self) {
+        self.keepalive_interval = self.keepalive_interval.max(self.min_interval);
+
+        if let Some(home) = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf()) {
+            for entry in &mut self.privacy.blacklist_paths {
+                if let Some(expanded) = expand_tilde(entry, &home) {
+                    *entry = expanded;
+                }
+            }
+        }
     }
 
     /// Serialize and write the config to [`Config::path`] atomically and durably.
@@ -300,7 +344,11 @@ impl Config {
         let contents = toml::to_string(self).map_err(std::io::Error::other)?;
 
         let tmp = path.with_extension("toml.tmp");
-        {
+
+        // Once the temp file exists, any failure (write/fsync/rename) must not
+        // leave a `.toml.tmp` turd behind (FR-3/AC-5, F11). Do the write inside a
+        // closure and best-effort `remove_file(&tmp)` on the way out of an error.
+        let write_tmp = || -> Result<(), std::io::Error> {
             let mut f = std::fs::OpenOptions::new()
                 .write(true)
                 .create(true)
@@ -309,9 +357,12 @@ impl Config {
                 .open(&tmp)?;
             f.write_all(contents.as_bytes())?;
             f.sync_all()?;
-        }
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
+            std::fs::rename(&tmp, &path)
+        };
+
+        write_tmp().inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
     }
 }
 
@@ -323,7 +374,7 @@ mod tests {
     fn defaults_are_safe() {
         let cfg = Config::default();
         assert_eq!(cfg.client_id, DEFAULT_CLIENT_ID);
-        assert_eq!(cfg.min_interval, 2.5);
+        assert_eq!(cfg.min_interval, 4.0);
         assert_eq!(cfg.keepalive_interval, 15.0);
         assert!(!cfg.show_ai_title, "ai-title must be off by default");
         assert!(cfg.buttons.is_empty(), "buttons are opt-in");
@@ -364,7 +415,7 @@ mod tests {
         assert_eq!(cfg.privacy.blacklist_paths.len(), 1);
         // Untouched fields keep their defaults.
         assert_eq!(cfg.client_id, DEFAULT_CLIENT_ID);
-        assert_eq!(cfg.min_interval, 2.5);
+        assert_eq!(cfg.min_interval, 4.0);
         // `redact` is unset in this TOML → keeps the (off-by-default) default.
         assert!(!cfg.privacy.redact);
     }
@@ -427,6 +478,108 @@ mod tests {
             "project stays at its true default"
         );
         assert!(!cfg.privacy.fields.command);
+    }
+
+    #[test]
+    fn keepalive_clamps_up_to_min_interval() {
+        // A keepalive shorter than the rate floor is raised to the floor so it
+        // cannot republish faster than `min_interval` (FR-2/AC-1, F19).
+        let toml = r#"
+            min_interval = 4.0
+            keepalive_interval = 1.0
+        "#;
+        let cfg = Config::from_toml(toml).unwrap();
+        assert_eq!(cfg.min_interval, 4.0);
+        assert_eq!(cfg.keepalive_interval, 4.0);
+    }
+
+    #[test]
+    fn keepalive_above_min_interval_is_untouched() {
+        // A keepalive already at/above the floor keeps its configured value.
+        let toml = r#"
+            min_interval = 4.0
+            keepalive_interval = 15.0
+        "#;
+        let cfg = Config::from_toml(toml).unwrap();
+        assert_eq!(cfg.keepalive_interval, 15.0);
+    }
+
+    #[test]
+    fn blacklist_tilde_entry_is_expanded_to_home() {
+        // `~/private` is expanded to the home-relative absolute path at load so
+        // the privacy matcher receives an already-expanded entry (FR-1/AC-5).
+        let home = directories::BaseDirs::new()
+            .map(|b| b.home_dir().to_path_buf())
+            .expect("home dir resolves in test env");
+        let toml = r#"
+            [privacy]
+            blacklist_paths = ["~/private"]
+        "#;
+        let cfg = Config::from_toml(toml).unwrap();
+        assert_eq!(cfg.privacy.blacklist_paths, vec![home.join("private")]);
+    }
+
+    #[test]
+    fn blacklist_absolute_entry_is_left_alone() {
+        // A non-`~` entry passes through normalization unchanged.
+        let toml = r#"
+            [privacy]
+            blacklist_paths = ["/Users/me/private"]
+        "#;
+        let cfg = Config::from_toml(toml).unwrap();
+        assert_eq!(
+            cfg.privacy.blacklist_paths,
+            vec![PathBuf::from("/Users/me/private")]
+        );
+    }
+
+    #[test]
+    fn expand_tilde_handles_bare_tilde_and_non_tilde() {
+        let home = PathBuf::from("/home/u");
+        assert_eq!(
+            expand_tilde(std::path::Path::new("~/a/b"), &home),
+            Some(PathBuf::from("/home/u/a/b"))
+        );
+        assert_eq!(
+            expand_tilde(std::path::Path::new("~"), &home),
+            Some(home.clone())
+        );
+        // Absolute and `~user` are left untouched (None → caller keeps original).
+        assert_eq!(expand_tilde(std::path::Path::new("/abs/path"), &home), None);
+        assert_eq!(expand_tilde(std::path::Path::new("~bob/x"), &home), None);
+    }
+
+    #[test]
+    fn save_failure_leaves_no_tmp_file() {
+        // A rename failure (target dir is actually a file) must best-effort remove
+        // the `.toml.tmp` scratch file (FR-3/AC-5, F11). We exercise the same
+        // write-then-cleanup-on-error shape `Config::save` uses, against a temp dir
+        // (the real `save` resolves a fixed user config path we must not clobber).
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("cp-cfg-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mk test dir");
+        let path = dir.join("config.toml");
+        let tmp = path.with_extension("toml.tmp");
+        // Make the rename target a directory so `rename(file -> dir)` fails.
+        std::fs::create_dir_all(&path).expect("mk target dir");
+
+        let write_tmp = || -> Result<(), std::io::Error> {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(b"min_interval = 4.0\n")?;
+            f.sync_all()?;
+            std::fs::rename(&tmp, &path)
+        };
+        let result = write_tmp().inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        });
+
+        assert!(result.is_err(), "rename onto a directory must fail");
+        assert!(
+            !tmp.exists(),
+            "the .toml.tmp scratch file must be cleaned up"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

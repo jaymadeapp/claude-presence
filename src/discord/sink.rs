@@ -20,6 +20,7 @@
 //!   (AC-3, AC-5);
 //! - detect a send failure, tear down, and reconnect with backoff (AC-4).
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use discord_rich_presence::activity::{Activity, Assets, Button, Timestamps};
@@ -38,6 +39,22 @@ const MAX_BUTTONS: usize = 2;
 /// failure (FR-6/AC-1, AC-4): exponential from `BACKOFF_MIN` to `BACKOFF_MAX`.
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// Discord's `SET_ACTIVITY` budget: at most [`RATE_MAX`] publishes in any rolling
+/// [`RATE_WINDOW`]. The rolling-window limiter ([`RateLimiter`]) is the **sole**
+/// guarantee of this ceiling — it counts every publish source together (distinct
+/// updates, the keepalive republish, and the on-(re)connect publish), which the
+/// `min_interval` debounce floor alone cannot bound (a keepalive landing between two
+/// floor-spaced updates can stack past the budget — ADR-1).
+const RATE_WINDOW: Duration = Duration::from_secs(20);
+const RATE_MAX: usize = 5;
+
+/// Fallback debounce floor when `min_interval` is invalid (0/NaN/inf). Must match
+/// `config::DEFAULT_MIN_INTERVAL_SECS` = 4.0, set by task 1.4 — kept as a local
+/// constant on purpose so this file stays disjoint from `config.rs` for the
+/// parallel wave (the two 4.0s values agree by comment, not by import). An invalid
+/// `min_interval` therefore cannot fall back below the budget (FR-2/AC-1).
+const FALLBACK_MIN_INTERVAL: Duration = Duration::from_secs(4);
 
 /// Run the Discord sink on a dedicated OS thread.
 ///
@@ -100,16 +117,23 @@ async fn sink_loop(
     cfg: Config,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let min_interval = duration_from_seconds(cfg.min_interval, Duration::from_millis(2500));
+    let min_interval = duration_from_seconds(cfg.min_interval, FALLBACK_MIN_INTERVAL);
     let keepalive = duration_from_seconds(cfg.keepalive_interval, Duration::from_secs(15));
 
     let mut client = DiscordIpcClient::new(cfg.client_id.to_string());
 
     // Persist the last publish time across reconnects so a flapping connection
-    // can't emit back-to-back `SET_ACTIVITY` calls below `min_interval` and blow
-    // Discord's 5-updates/20s budget (FR-6/AC-5). A per-`serve` clock would reset
-    // on every reconnect; this one outlives them.
+    // can't emit back-to-back `SET_ACTIVITY` calls below `min_interval`. This is the
+    // debounce floor only; the hard `RATE_MAX`/`RATE_WINDOW` budget is enforced by
+    // the rolling-window `RateLimiter` below, which counts every publish source
+    // together (FR-2/AC-1, ADR-1). A per-`serve` clock would reset on every
+    // reconnect; this one outlives them.
     let mut last_publish_at: Option<Instant> = None;
+
+    // The rolling-window limiter is the sole guarantee of Discord's rate budget; it
+    // persists across reconnects so a flapping connection's on-connect publishes are
+    // counted against the same window (FR-2/AC-1).
+    let mut limiter = RateLimiter::new();
 
     'outer: loop {
         if *shutdown.borrow() {
@@ -131,6 +155,7 @@ async fn sink_loop(
             min_interval,
             keepalive,
             &mut last_publish_at,
+            &mut limiter,
         )
         .await
         {
@@ -161,31 +186,175 @@ enum ServeOutcome {
     Disconnected,
 }
 
+/// Decide how long a publish must wait to fit the rolling-window budget — the **pure**
+/// core of the rate limiter, factored out so the window logic is unit-testable with
+/// constructed `Instant`s (no async, no clock mocking).
+///
+/// `recent` is the set of publish timestamps still inside the window (oldest first;
+/// the caller prunes aged-out entries first). Returns `None` if a publish fits right
+/// now (fewer than `max` timestamps remain), or `Some(wait)` — how long until the
+/// oldest ages out and frees the next slot — when `max` timestamps are already in the
+/// window. With `recent` pruned to entries newer than `window`, `len() == max` means
+/// the front is the timestamp whose expiry opens the next slot.
+fn window_wait(
+    now: Instant,
+    recent: &VecDeque<Instant>,
+    window: Duration,
+    max: usize,
+) -> Option<Duration> {
+    if recent.len() < max {
+        return None;
+    }
+    let oldest = *recent.front()?;
+    let age = now.saturating_duration_since(oldest);
+    Some(window.saturating_sub(age))
+}
+
+/// Rolling-window rate limiter enforcing Discord's `RATE_MAX`/`RATE_WINDOW`
+/// `SET_ACTIVITY` budget (FR-2/AC-1, ADR-1). It records every publish timestamp —
+/// updates, keepalive republishes, and on-(re)connect publishes alike — and, before
+/// each publish, blocks until fewer than `RATE_MAX` timestamps remain inside the
+/// window. This is the **sole** ceiling; `min_interval` is only the debounce floor.
+///
+/// Timestamps use `std::time::Instant` so the limiter shares one clock with
+/// `last_publish_at`/`debounce_remaining`, and so the window decision ([`window_wait`])
+/// is a pure function testable with constructed instants.
+struct RateLimiter {
+    /// Recent publish timestamps, oldest first; entries older than the window are
+    /// pruned on each gate.
+    recent: VecDeque<Instant>,
+}
+
+impl RateLimiter {
+    fn new() -> Self {
+        Self {
+            recent: VecDeque::with_capacity(RATE_MAX + 1),
+        }
+    }
+
+    /// Drop timestamps that have aged out of the rolling window relative to `now`.
+    fn prune(&mut self, now: Instant) {
+        while let Some(&oldest) = self.recent.front() {
+            if now.saturating_duration_since(oldest) >= RATE_WINDOW {
+                self.recent.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Block (interruptibly via the shutdown watch) until a publish fits the budget,
+    /// pruning the window first. Returns `true` if shutdown was signalled while
+    /// waiting (caller should abort the publish). Does NOT record the publish — call
+    /// [`RateLimiter::record_now`] after a publish actually happens. The window
+    /// decision is delegated to the pure [`window_wait`].
+    async fn gate(&mut self, shutdown: &mut watch::Receiver<bool>) -> bool {
+        loop {
+            let now = Instant::now();
+            self.prune(now);
+            match window_wait(now, &self.recent, RATE_WINDOW, RATE_MAX) {
+                None => return false,
+                Some(wait) => {
+                    if wait_or_shutdown(wait, shutdown).await {
+                        return true;
+                    }
+                    // Re-loop to re-prune at the new instant before publishing.
+                }
+            }
+        }
+    }
+
+    /// Record that a publish just happened at the current instant.
+    fn record_now(&mut self) {
+        self.recent.push_back(Instant::now());
+    }
+}
+
 /// Connect (with handshake) to Discord, retrying with exponential backoff while
 /// the daemon keeps running. Returns `false` only if shutdown was requested
 /// before a connection was established (so the caller exits cleanly).
+///
+/// The synchronous `connect()` can wedge on a half-open Discord, so it runs on a
+/// `spawn_blocking` task `select!`-ed against the shutdown watch: a shutdown signal
+/// pre-empts both the backoff sleep AND a stuck handshake, instead of waiting for
+/// the blocking call to return (FR-2/AC-3, F12). The wedged blocking task is
+/// detached on shutdown; the daemon exits regardless.
 async fn connect_with_backoff(
     client: &mut DiscordIpcClient,
     shutdown: &mut watch::Receiver<bool>,
 ) -> bool {
+    // Capture the configured client id up front so a recovery path that lost the
+    // real client (panicked task / detached blocking connect on shutdown) can
+    // rebuild a correctly-configured client instead of leaving the empty-string
+    // placeholder installed across a loop iteration.
+    let client_id = client.get_client_id().to_string();
+
     let mut backoff = BACKOFF_MIN;
     loop {
         if *shutdown.borrow() {
             return false;
         }
 
-        // Attempt to connect directly: the crate's `connect` scans
+        // Attempt to connect on a blocking task: the crate's `connect` scans
         // `[XDG_RUNTIME_DIR, TMPDIR, TMP, TEMP]` for the `discord-ipc-0..9`
         // socket, which is wider than a `$TMPDIR`-only pre-probe. Relying on its
         // `Err` arm for retry keeps the "retry, don't exit" semantics while
-        // staying correct when the socket lives outside `$TMPDIR`.
-        match client.connect() {
-            Ok(()) => {
-                tracing::info!("discord sink: connected");
-                return true;
+        // staying correct when the socket lives outside `$TMPDIR`. Move the client
+        // into the task and recover it on completion (a fresh placeholder stands in
+        // while the blocking call runs).
+        let placeholder = DiscordIpcClient::new(String::new());
+        let mut owned = std::mem::replace(client, placeholder);
+        let mut join = tokio::task::spawn_blocking(move || {
+            let result = owned.connect();
+            (owned, result)
+        });
+
+        tokio::select! {
+            joined = &mut join => {
+                match joined {
+                    Ok((recovered, result)) => {
+                        *client = recovered;
+                        match result {
+                            Ok(()) => {
+                                tracing::info!("discord sink: connected");
+                                return true;
+                            }
+                            Err(err) => {
+                                tracing::debug!(%err, "discord sink: connect failed; will retry");
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        // The blocking task panicked; the real client is lost with it,
+                        // so install a fresh client with the configured id and retry
+                        // with backoff (degrade, never crash) — never carry the
+                        // empty-string placeholder forward.
+                        tracing::debug!(%err, "discord sink: connect task failed; will retry");
+                        *client = DiscordIpcClient::new(&client_id);
+                    }
+                }
             }
-            Err(err) => {
-                tracing::debug!(%err, "discord sink: connect failed; will retry");
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    // Real shutdown pre-empts a possibly-wedged handshake (FR-2/AC-3).
+                    // Do NOT block-await the connect task — it may be stuck on a
+                    // half-open Discord, and stalling here would defeat the bounded
+                    // shutdown (the OS reaps the detached thread; the 3s join in
+                    // lib.rs bounds the wait — ADR-2). Restore a real, configured
+                    // client into `*client` so the empty-string placeholder is never
+                    // carried out of this function, then detach the task and exit.
+                    *client = DiscordIpcClient::new(&client_id);
+                    drop(join);
+                    return false;
+                }
+                // Spurious wakeup: the watch fired but shutdown is still false, so the
+                // connect is NOT being torn down. Recover the real client from the
+                // in-flight task (await it — it completes normally or errors; this is
+                // not the wedged-shutdown path) so the placeholder is never carried
+                // into the next loop iteration, then fall through to the backoff and
+                // retry. This is the latent-defect fix: the old code fell through here
+                // leaving `*client` as the placeholder and abandoning the task.
+                recover_client(client, join, &client_id).await;
             }
         }
 
@@ -194,6 +363,37 @@ async fn connect_with_backoff(
             return false;
         }
         backoff = next_backoff(backoff);
+    }
+}
+
+/// Restore a real, configured client into `*client` after a **spurious** shutdown-watch
+/// wakeup during a connect attempt — so the empty-string placeholder is never carried
+/// across a loop iteration (and the in-flight blocking connect is never abandoned).
+///
+/// The in-flight `connect()` runs on `join`, which owns the real client. Because this
+/// is the spurious-wakeup path (shutdown is still false), the connect is not being torn
+/// down, so awaiting the task is safe: if it finished cleanly we move the real client
+/// back; if it panicked we install a fresh client built from the configured
+/// `client_id`. Either way `*client` ends up holding a properly-configured client for
+/// the next backoff attempt, and the blocking task is joined rather than leaked.
+///
+/// The real-shutdown path does NOT use this helper: it must not block-await a possibly
+/// wedged handshake (FR-2/AC-3), so it installs a fresh client and detaches the task.
+async fn recover_client<R>(
+    client: &mut DiscordIpcClient,
+    join: tokio::task::JoinHandle<(DiscordIpcClient, R)>,
+    client_id: &str,
+) {
+    match join.await {
+        Ok((recovered, _result)) => {
+            *client = recovered;
+        }
+        Err(err) => {
+            // The blocking connect panicked, taking the real client with it; rebuild
+            // a fresh client from the configured id rather than leaving a placeholder.
+            tracing::debug!(%err, "discord sink: connect task failed during recovery");
+            *client = DiscordIpcClient::new(client_id);
+        }
     }
 }
 
@@ -207,22 +407,29 @@ async fn serve(
     min_interval: Duration,
     keepalive: Duration,
     last_publish_at: &mut Option<Instant>,
+    limiter: &mut RateLimiter,
 ) -> ServeOutcome {
     // Publish the current value on (re)connect so a fresh socket reflects live
     // state at once; this also seeds the keepalive baseline. Gate it by
-    // `min_interval` against the *persisted* last publish so a flapping
-    // connection can't burst past Discord's rate limit (FR-6/AC-5).
+    // `min_interval` (debounce floor) AND the rolling-window limiter (hard ceiling)
+    // against the *persisted* state so a flapping connection's on-connect publishes
+    // can't burst past Discord's budget (FR-2/AC-1).
     if let Some(wait) = debounce_remaining(*last_publish_at, min_interval) {
         if wait_or_shutdown(wait, shutdown).await {
             return ServeOutcome::Shutdown;
         }
     }
+    if limiter.gate(shutdown).await {
+        return ServeOutcome::Shutdown;
+    }
+    // First publish on this connection: clone once to retain it as the keepalive
+    // baseline (this is per-connect, not per-iteration — F20/F37).
     let current = rx.borrow().clone();
     if publish(client, &current).is_err() {
         return ServeOutcome::Disconnected;
     }
+    record_publish(limiter, last_publish_at);
     let mut last_published: Option<PresenceUpdate> = Some(current);
-    *last_publish_at = Some(Instant::now());
 
     loop {
         if *shutdown.borrow() {
@@ -251,18 +458,27 @@ async fn serve(
                     return ServeOutcome::Shutdown;
                 }
                 // Debounce/coalesce: respect min_interval since the last publish,
-                // collapsing any bursts to the newest value (FR-6/AC-3, AC-5).
+                // collapsing any bursts to the newest value (FR-2/AC-1).
                 if let Some(wait) = debounce_remaining(*last_publish_at, min_interval) {
                     if wait_or_shutdown(wait, shutdown).await {
                         return ServeOutcome::Shutdown;
                     }
                 }
-                let latest = rx.borrow().clone(); // newest after the debounce wait
-                if update_changed(last_published.as_ref(), &latest) {
+                // Decide whether to publish without cloning the (possibly large)
+                // model: compare the newest borrowed value against the last one
+                // (F20/F37). Only clone-to-publish when it actually changed.
+                let changed = update_changed(last_published.as_ref(), &rx.borrow());
+                if changed {
+                    // The rolling window is the hard ceiling — gate every publish
+                    // (FR-2/AC-1). Re-read the newest value after the wait.
+                    if limiter.gate(shutdown).await {
+                        return ServeOutcome::Shutdown;
+                    }
+                    let latest = rx.borrow().clone();
                     match publish(client, &latest) {
                         Ok(()) => {
                             last_published = Some(latest);
-                            *last_publish_at = Some(Instant::now());
+                            record_publish(limiter, last_publish_at);
                         }
                         Err(()) => return ServeOutcome::Disconnected,
                     }
@@ -270,12 +486,28 @@ async fn serve(
             }
 
             // Keepalive: republish the last model so the presence doesn't expire
-            // (FR-6/AC-3).
+            // (FR-2/AC-1). Gate it behind the debounce window so a keepalive can't
+            // fire inside `min_interval` (F19), AND behind the rolling-window limiter
+            // (which counts keepalives against the budget). Republish from the
+            // already-held `last_published` by reference — no fresh deep clone
+            // (F20/F37).
             _ = &mut keepalive_sleep => {
-                if let Some(model) = last_published.clone() {
-                    match publish(client, &model) {
-                        Ok(()) => *last_publish_at = Some(Instant::now()),
-                        Err(()) => return ServeOutcome::Disconnected,
+                if last_published.is_some() {
+                    if let Some(wait) = debounce_remaining(*last_publish_at, min_interval) {
+                        if wait_or_shutdown(wait, shutdown).await {
+                            return ServeOutcome::Shutdown;
+                        }
+                    }
+                    if limiter.gate(shutdown).await {
+                        return ServeOutcome::Shutdown;
+                    }
+                    // `last_published` is still `Some` after the awaits (only this
+                    // task mutates it). Borrow it for the republish — no deep clone.
+                    if let Some(model) = last_published.as_ref() {
+                        match publish(client, model) {
+                            Ok(()) => record_publish(limiter, last_publish_at),
+                            Err(()) => return ServeOutcome::Disconnected,
+                        }
                     }
                 } else {
                     *last_publish_at = Some(Instant::now());
@@ -283,6 +515,13 @@ async fn serve(
             }
         }
     }
+}
+
+/// Record a successful publish at the current instant against both the debounce
+/// clock and the rolling-window limiter, keeping the two in lock-step.
+fn record_publish(limiter: &mut RateLimiter, last_publish_at: &mut Option<Instant>) {
+    limiter.record_now();
+    *last_publish_at = Some(Instant::now());
 }
 
 /// Apply a [`PresenceUpdate`] to the live connection. Maps `Clear` to
@@ -638,6 +877,157 @@ mod tests {
     }
 
     #[test]
+    fn min_interval_zero_resolves_to_fallback_floor() {
+        // An invalid (0/NaN/inf/negative) `min_interval` must fall back to the 4.0s
+        // FALLBACK_MIN_INTERVAL, never below the budget (FR-2/AC-1). This mirrors the
+        // resolution `sink_loop` performs and pins the floor at 4.0s.
+        assert_eq!(FALLBACK_MIN_INTERVAL, Duration::from_secs(4));
+        assert_eq!(
+            duration_from_seconds(0.0, FALLBACK_MIN_INTERVAL),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            duration_from_seconds(-1.0, FALLBACK_MIN_INTERVAL),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            duration_from_seconds(f64::NAN, FALLBACK_MIN_INTERVAL),
+            Duration::from_secs(4)
+        );
+        // A valid configured value is honored unchanged.
+        assert_eq!(
+            duration_from_seconds(4.0, FALLBACK_MIN_INTERVAL),
+            Duration::from_secs(4)
+        );
+    }
+
+    /// Build a `VecDeque<Instant>` of publish timestamps at `base + offset_secs[i]`,
+    /// mirroring what the limiter holds after a run of recorded publishes. Used by
+    /// the pure-`window_wait` tests so no clock mocking / paused time is needed.
+    fn recent_at(base: Instant, offsets_secs: &[u64]) -> VecDeque<Instant> {
+        offsets_secs
+            .iter()
+            .map(|&s| base + Duration::from_secs(s))
+            .collect()
+    }
+
+    #[test]
+    fn rate_limiter_caps_at_five_per_rolling_window() {
+        // The window limiter is the SOLE 5/20s guarantee: it counts every publish
+        // source together (on-connect + updates + keepalive). Drive RATE_MAX publishes
+        // spaced just under the window; the next one must be forced to wait until the
+        // oldest ages out (FR-2/AC-1). The decision is the pure `window_wait`, tested
+        // here with constructed instants — no async, no paused clock.
+        let base = Instant::now();
+
+        // RATE_MAX publishes (incl. an on-connect + a keepalive routing through the
+        // same path), one every 4s. All fit, none has to wait.
+        for i in 0..RATE_MAX {
+            let now = base + Duration::from_secs(4 * i as u64);
+            // The first `i` timestamps are in the window at `now`.
+            let recent = recent_at(base, &(0..i as u64).map(|k| 4 * k).collect::<Vec<_>>());
+            assert_eq!(
+                window_wait(now, &recent, RATE_WINDOW, RATE_MAX),
+                None,
+                "publish {i} should fit without waiting"
+            );
+        }
+
+        // The 6th publish at t=16s: 5 timestamps (0,4,8,12,16) are still inside the
+        // rolling 20s, so it must wait until the oldest (t=0) ages out at t=20s — ~4s.
+        let recent_full = recent_at(base, &[0, 4, 8, 12, 16]);
+        let sixth = base + Duration::from_secs(16);
+        let wait = window_wait(sixth, &recent_full, RATE_WINDOW, RATE_MAX)
+            .expect("a 6th publish inside the window must wait");
+        assert_eq!(
+            wait,
+            Duration::from_secs(4),
+            "must wait for the oldest slot"
+        );
+
+        // Once the oldest ages out (t=20s) the limiter's prune drops it and a publish
+        // fits — exercise prune + window_wait together.
+        let mut limiter = RateLimiter::new();
+        limiter.recent = recent_full;
+        let after = base + Duration::from_secs(20);
+        limiter.prune(after);
+        assert_eq!(
+            window_wait(after, &limiter.recent, RATE_WINDOW, RATE_MAX),
+            None
+        );
+        // Invariant: never more than RATE_MAX timestamps survive a prune in-window.
+        assert!(limiter.recent.len() <= RATE_MAX);
+    }
+
+    #[test]
+    fn rate_limiter_window_slides() {
+        // Publishes older than RATE_WINDOW are pruned, so an old burst does not
+        // permanently consume the budget.
+        let base = Instant::now();
+        let mut limiter = RateLimiter::new();
+        limiter.recent = recent_at(base, &[0, 1, 2, 3, 4]);
+        // Far in the future, every old timestamp has aged out → full budget again.
+        let later = base + RATE_WINDOW + Duration::from_secs(5);
+        limiter.prune(later);
+        assert!(limiter.recent.is_empty());
+        assert_eq!(
+            window_wait(later, &limiter.recent, RATE_WINDOW, RATE_MAX),
+            None
+        );
+    }
+
+    #[test]
+    fn window_wait_is_pure_and_boundary_correct() {
+        let base = Instant::now();
+        // Empty window: always room.
+        let empty = VecDeque::new();
+        assert_eq!(window_wait(base, &empty, RATE_WINDOW, RATE_MAX), None);
+        // Under the cap: room, no wait.
+        let under = recent_at(base, &[0, 1, 2, 4]);
+        assert_eq!(
+            window_wait(base + Duration::from_secs(4), &under, RATE_WINDOW, RATE_MAX),
+            None
+        );
+        // Exactly the oldest aged out (age == window) → the saturating subtraction
+        // yields a zero wait, i.e. "publish now after the next prune".
+        let full = recent_at(base, &[0, 4, 8, 12, 16]);
+        assert_eq!(
+            window_wait(base + RATE_WINDOW, &full, RATE_WINDOW, RATE_MAX),
+            Some(Duration::ZERO)
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_gate_is_interruptible_by_shutdown() {
+        // R4: a saturated limiter wait must yield to shutdown rather than stalling
+        // teardown. Plain (un-paused) real time: shutdown is signalled *before* the
+        // gate, so `wait_or_shutdown` returns immediately via the shutdown path and
+        // the test never sleeps the full window.
+        let mut limiter = RateLimiter::new();
+        let (tx, mut shutdown) = watch::channel(false);
+        // Saturate the window with RATE_MAX recorded publishes (all free).
+        for _ in 0..RATE_MAX {
+            assert!(
+                !limiter.gate(&mut shutdown).await,
+                "early publishes are free"
+            );
+            limiter.record_now();
+        }
+        // Signal shutdown, then a saturated gate must return `true` (interrupted)
+        // promptly instead of waiting the full window.
+        tx.send(true).expect("send shutdown");
+        let started = Instant::now();
+        assert!(
+            limiter.gate(&mut shutdown).await,
+            "a saturated gate must abort on shutdown"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "an interrupted gate must return promptly, not wait the window"
+        );
+    }
+
+    #[test]
     fn debounce_remaining_accounts_for_persisted_last_publish() {
         let min_interval = Duration::from_secs(5);
 
@@ -659,5 +1049,60 @@ mod tests {
             .checked_sub(min_interval + Duration::from_secs(1))
             .expect("instant arithmetic");
         assert_eq!(debounce_remaining(Some(long_ago), min_interval), None);
+    }
+
+    /// A spurious shutdown-watch wakeup during a connect attempt must NOT leave the
+    /// empty-string placeholder installed in `*client`: `recover_client` restores the
+    /// real client (its configured client_id) before the next loop iteration. This
+    /// pins the latent-defect fix — the old `changed` arm fell through here, leaving
+    /// the placeholder and abandoning the in-flight connect task.
+    #[tokio::test]
+    async fn recover_client_restores_real_client_on_spurious_wakeup() {
+        const REAL_ID: &str = "1518007333324587168";
+
+        // Mirror connect_with_backoff: the real client is moved into the blocking
+        // task while a placeholder stands in. Here the "connect" finishes without a
+        // socket — we only assert recovery, not a live handshake.
+        let real = DiscordIpcClient::new(REAL_ID);
+        let placeholder = DiscordIpcClient::new(String::new());
+        let mut client = placeholder;
+        let join = tokio::task::spawn_blocking(move || {
+            // Stand-in for `owned.connect()`; the result variant is irrelevant to
+            // recovery, so use a unit result.
+            (real, ())
+        });
+
+        // Before recovery the placeholder (empty id) is installed.
+        assert_eq!(client.get_client_id(), "");
+
+        recover_client(&mut client, join, REAL_ID).await;
+
+        // After a spurious-wakeup recovery the REAL client is back — never the
+        // empty-string placeholder.
+        assert_eq!(
+            client.get_client_id(),
+            REAL_ID,
+            "recovery must restore the real client, not leave the placeholder"
+        );
+    }
+
+    /// If the in-flight connect task panicked, recovery must still install a fresh,
+    /// configured client (built from the captured client_id) rather than carrying the
+    /// empty-string placeholder forward (degrade, never crash).
+    #[tokio::test]
+    async fn recover_client_rebuilds_from_id_when_task_panics() {
+        const REAL_ID: &str = "1518007333324587168";
+
+        let mut client = DiscordIpcClient::new(String::new());
+        let join: tokio::task::JoinHandle<(DiscordIpcClient, ())> =
+            tokio::task::spawn_blocking(|| panic!("simulated connect panic"));
+
+        recover_client(&mut client, join, REAL_ID).await;
+
+        assert_eq!(
+            client.get_client_id(),
+            REAL_ID,
+            "a panicked connect must rebuild a configured client, never a placeholder"
+        );
     }
 }

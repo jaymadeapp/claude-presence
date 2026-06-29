@@ -270,7 +270,7 @@ pub fn aggregate_channel(
     let mut aggregator = Aggregator::new(cfg.clone());
     let initial = aggregator.aggregate(sessions_rx.borrow().clone());
     let (tx, rx) = watch::channel(initial);
-    let debounce = duration_from_seconds(cfg.min_interval);
+    let debounce = duration_from_seconds(cfg.min_interval, COALESCE_FLOOR);
 
     tokio::spawn(async move {
         loop {
@@ -365,8 +365,10 @@ fn format_details(
 
     // Append the gated ai-title when opted-in, not private, and not blacklisted.
     // `privacy::ai_title` enforces the opt-in + blacklist + secret-scrub; we only
-    // surface it when there is room within the ≤128 cap.
-    if !private {
+    // surface it when there is room within the ≤128 cap. The ai-title is also
+    // suppressed when the project is hidden (`fields.project = false`), mirroring
+    // the branch gate above — it can reveal the project the session is working on.
+    if !private && cfg.privacy.fields.project {
         if let Some(title) = crate::privacy::ai_title(
             session.title.as_deref(),
             cfg.show_ai_title,
@@ -623,7 +625,7 @@ fn format_tokens(tokens: u64) -> String {
     if tokens >= 1_000_000 {
         format!("{:.1}M tok", tokens as f64 / 1_000_000.0)
     } else if tokens >= 1_000 {
-        format!("{}K tok", (tokens + 500) / 1_000)
+        format!("{}K tok", tokens.saturating_add(500) / 1_000)
     } else {
         format!("{tokens} tok")
     }
@@ -687,11 +689,19 @@ fn system_time_to_epoch_ms(time: SystemTime) -> i64 {
     }
 }
 
-fn duration_from_seconds(seconds: f64) -> Duration {
+/// The aggregator's own anti-busy-spin coalesce floor: a non-positive/non-finite
+/// `min_interval` collapses the debounce window to zero and busy-spins the inner
+/// coalesce loop (F33). Clamp it to a safe non-zero default instead. This is
+/// independent of the sink's `FALLBACK_MIN_INTERVAL` (4.0s) rate floor — the sink's
+/// rolling window is the rate ceiling; this is purely to keep the coalesce loop from
+/// sleeping zero in a hot loop.
+const COALESCE_FLOOR: Duration = Duration::from_millis(2500);
+
+fn duration_from_seconds(seconds: f64, fallback: Duration) -> Duration {
     if seconds.is_finite() && seconds > 0.0 {
         Duration::from_secs_f64(seconds)
     } else {
-        Duration::from_millis(0)
+        fallback
     }
 }
 
@@ -1256,6 +1266,65 @@ mod tests {
             model_on.details
         );
         assert!(char_count(&model_on.details) <= DISCORD_TEXT_LIMIT);
+    }
+
+    #[test]
+    fn ai_title_suppressed_when_project_hidden() {
+        // FR-1/AC-2 (F9): hiding the project (`fields.project = false`) must also
+        // suppress the ai-title — even with `show_ai_title = true` and no global
+        // redact/blacklist — mirroring the branch gate. Today's code only gated on
+        // `!private`, leaking the title into details.
+        let mut s = session("a", 10);
+        s.title = Some("Refactor the parser".to_string());
+
+        let mut cfg = Config {
+            show_ai_title: true,
+            ..Config::default()
+        };
+        cfg.privacy.fields.project = false;
+        assert!(!cfg.privacy.redact, "redact must stay off for this test");
+
+        let mut aggregator = Aggregator::new(cfg);
+        let PresenceUpdate::Activity(model) = aggregator.aggregate(vec![s]) else {
+            panic!("expected activity");
+        };
+        assert!(
+            !model.details.contains("Refactor the parser"),
+            "{}",
+            model.details
+        );
+    }
+
+    #[test]
+    fn format_tokens_saturates_without_overflow() {
+        // FR-6/AC-1 (F32): `tokens + 500` would overflow on a saturated u64 total
+        // and panic in debug builds. `saturating_add` keeps it finite.
+        let rendered = format_tokens(u64::MAX);
+        // u64::MAX >= 1_000_000, so it renders via the "M tok" branch (no add) —
+        // exercise the "K tok" branch's saturating add directly for a value near the
+        // boundary too.
+        assert!(rendered.contains("tok"), "{rendered}");
+        // A value in the K range just under u64::MAX/1000 still must not overflow.
+        let near = format_tokens(999_999);
+        assert_eq!(near, "1000K tok");
+    }
+
+    #[test]
+    fn duration_from_seconds_falls_back_on_bad_input() {
+        // FR-6/AC-3 (F33): a non-positive / non-finite `min_interval` must not
+        // collapse the coalesce window to zero (which busy-spins the inner loop).
+        // The aggregator clamps to its own 2.5s coalesce floor.
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let d = duration_from_seconds(bad, COALESCE_FLOOR);
+            assert_eq!(d, COALESCE_FLOOR, "input {bad} must clamp to the floor");
+            assert!(!d.is_zero(), "input {bad} must not yield Duration::ZERO");
+        }
+        assert_eq!(COALESCE_FLOOR, Duration::from_millis(2500));
+        // A valid positive interval still passes through unchanged.
+        assert_eq!(
+            duration_from_seconds(4.0, COALESCE_FLOOR),
+            Duration::from_secs(4)
+        );
     }
 
     #[test]

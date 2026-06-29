@@ -23,8 +23,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 
+use std::sync::Arc;
+
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
@@ -38,6 +40,21 @@ const MAX_LINE_BYTES: u64 = 64 * 1024;
 /// Bound on overlays buffered toward the run loop before backpressure; bursts of
 /// hook events are absorbed without blocking accept.
 const OVERLAY_CHANNEL_CAP: usize = 256;
+
+/// Cap on in-flight connection-handler tasks (FR-7/AC-1). A flood of simultaneous
+/// connections cannot spawn unbounded tasks or hold unbounded fds: a permit is
+/// taken per accepted connection and a connection over the cap is dropped at once.
+const MAX_INFLIGHT_CONNECTIONS: usize = 16;
+
+/// Idle ceiling on a single read (FR-7/AC-1). A slowloris peer that connects but
+/// never writes (or stalls mid-frame) is closed once no bytes arrive within this
+/// window, rather than pinning a task forever.
+const READ_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Hard ceiling on a single connection's total lifetime (FR-7/AC-1). Even a peer
+/// that dribbles a byte just inside every idle window cannot hold a task open
+/// indefinitely; past this deadline the connection is closed.
+const CONNECTION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Resolve the daemon ingest socket path: `~/.local/state/claude-presence/daemon.sock`.
 ///
@@ -80,9 +97,10 @@ pub fn serve(cfg: Config) -> Result<IngestServer> {
 
     let (tx, rx) = mpsc::channel::<Overlay>(OVERLAY_CHANNEL_CAP);
     let own_uid = nix::unistd::Uid::current().as_raw();
+    let limit = Arc::new(Semaphore::new(MAX_INFLIGHT_CONNECTIONS));
 
     let handle = tokio::spawn(async move {
-        accept_loop(listener, cfg, own_uid, tx).await;
+        accept_loop(listener, cfg, own_uid, tx, limit).await;
         // Best-effort cleanup so a later run can rebind without a stale-file race.
         let _ = std::fs::remove_file(&path);
         debug!("ingest: accept loop exited");
@@ -127,7 +145,18 @@ fn ensure_dir_0700(dir: &Path) -> Result<()> {
 
 /// Accept connections until the listener errors or the overlay receiver is
 /// dropped, handling each on its own task.
-async fn accept_loop(listener: UnixListener, cfg: Config, own_uid: u32, tx: mpsc::Sender<Overlay>) {
+///
+/// `limit` caps in-flight handler tasks (FR-7/AC-1): a permit is taken per
+/// accepted connection and held for the connection's lifetime; once
+/// [`MAX_INFLIGHT_CONNECTIONS`] permits are out, a new connection is dropped at
+/// once rather than spawning an unbounded task.
+async fn accept_loop(
+    listener: UnixListener,
+    cfg: Config,
+    own_uid: u32,
+    tx: mpsc::Sender<Overlay>,
+    limit: Arc<Semaphore>,
+) {
     /// Abandon the socket after this many consecutive accept failures so a
     /// pathological flood (e.g. EMFILE that never clears) is bounded.
     const MAX_CONSECUTIVE_FAILURES: u32 = 50;
@@ -142,9 +171,17 @@ async fn accept_loop(listener: UnixListener, cfg: Config, own_uid: u32, tx: mpsc
             res = listener.accept() => match res {
                 Ok((stream, _addr)) => {
                     consecutive_failures = 0;
+                    // Cap in-flight handlers (FR-7/AC-1): a flood over the cap is
+                    // dropped here so it can never exhaust fds/tasks. The permit is
+                    // moved into the task and released when the handler returns.
+                    let Ok(permit) = Arc::clone(&limit).try_acquire_owned() else {
+                        warn!("ingest: connection cap reached; dropping connection");
+                        continue;
+                    };
                     let cfg = cfg.clone();
                     let tx = tx.clone();
                     tokio::spawn(async move {
+                        let _permit = permit;
                         handle_conn(stream, cfg, own_uid, tx).await;
                     });
                 }
@@ -191,16 +228,33 @@ async fn handle_conn(stream: UnixStream, cfg: Config, own_uid: u32, tx: mpsc::Se
 /// enabled in `Cargo.toml` (owned by another task), so framing is done by hand
 /// over [`UnixStream`]'s inherent `readable`/`try_read` — both available with
 /// just the `net` feature. A partial trailing line is held in `buf` across reads;
-/// an over-long unterminated buffer is dropped without ever being logged
-/// (FR-8/AC-4).
+/// an over-long unterminated frame closes the connection without ever being logged
+/// (FR-7/AC-2, FR-8/AC-4).
+///
+/// Two `tokio::time::timeout` ceilings bound a misbehaving peer (FR-7/AC-1): each
+/// read waits at most [`READ_IDLE_TIMEOUT`] for bytes (slowloris defence), and the
+/// whole connection is closed once [`CONNECTION_DEADLINE`] elapses (a peer that
+/// dribbles just inside every idle window still cannot pin the task forever).
 async fn read_lines(stream: UnixStream, cfg: Config, tx: mpsc::Sender<Overlay>) {
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     let mut chunk = [0u8; 8192];
+    let deadline = tokio::time::Instant::now() + CONNECTION_DEADLINE;
 
     loop {
-        if let Err(err) = stream.readable().await {
-            warn!(kind = %err.kind(), "ingest: readable() failed; closing connection");
-            break;
+        // The next read may wait at most until the idle timeout or the overall
+        // connection deadline, whichever is sooner; on elapse the connection is
+        // closed (no bytes are ever logged).
+        let idle_deadline = tokio::time::Instant::now() + READ_IDLE_TIMEOUT;
+        match tokio::time::timeout_at(idle_deadline.min(deadline), stream.readable()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                warn!(kind = %err.kind(), "ingest: readable() failed; closing connection");
+                break;
+            }
+            Err(_) => {
+                warn!("ingest: connection idle/deadline exceeded; closing");
+                break;
+            }
         }
         match stream.try_read(&mut chunk) {
             Ok(0) => break, // peer closed
@@ -209,10 +263,12 @@ async fn read_lines(stream: UnixStream, cfg: Config, tx: mpsc::Sender<Overlay>) 
                 if drain_lines(&mut buf, &cfg, &tx).await.is_break() {
                     break;
                 }
-                // A frame that never terminates must not grow unbounded.
+                // A frame that never terminates must not grow unbounded; close the
+                // connection rather than silently resyncing a hostile stream
+                // (FR-7/AC-2). The bytes are never logged (FR-8/AC-4).
                 if buf.len() as u64 > MAX_LINE_BYTES {
-                    warn!("ingest: dropping oversized unterminated frame");
-                    buf.clear();
+                    warn!("ingest: oversized unterminated frame; closing connection");
+                    break;
                 }
             }
             // `try_read` after `readable` can still report WouldBlock spuriously.
@@ -379,6 +435,12 @@ mod tests {
         1 // EPERM on macOS and Linux.
     }
 
+    /// A full-size connection-cap semaphore for `accept_loop` in tests that do not
+    /// exercise the cap itself.
+    fn test_limit() -> Arc<Semaphore> {
+        Arc::new(Semaphore::new(MAX_INFLIGHT_CONNECTIONS))
+    }
+
     #[test]
     fn forward_is_non_failing_when_socket_absent() {
         // FR-4/AC-3: with no daemon listening, delivery fails internally but
@@ -418,7 +480,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<Overlay>(8);
 
         let server = tokio::spawn(async move {
-            accept_loop(listener, Config::default(), own_uid, tx).await;
+            accept_loop(listener, Config::default(), own_uid, tx, test_limit()).await;
         });
 
         // Write from a blocking thread, mirroring the real CLI path.
@@ -458,7 +520,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<Overlay>(8);
 
         let server = tokio::spawn(async move {
-            accept_loop(listener, Config::default(), own_uid, tx).await;
+            accept_loop(listener, Config::default(), own_uid, tx, test_limit()).await;
         });
 
         let write_path = path.clone();
