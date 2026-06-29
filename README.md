@@ -10,7 +10,7 @@
 [![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey)](#prerequisites)
 [![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-ec4899)](https://github.com/sponsors/jaymadeapp)
 
-<img src="docs/card.png" alt="Discord Rich Presence card showing CC / Working across 5 sessions / 5 Agents · Max 20x · 312K tok · Ctx 30% and an elapsed timer, with a Get claude-presence button" width="440">
+<img src="docs/card.png" alt="Discord Rich Presence card: CC — Working across 4 sessions — 16× Opus 4.8 · 2.3M tok, with an elapsed timer" width="440">
 
 </div>
 
